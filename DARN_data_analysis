@@ -1,0 +1,410 @@
+####### DUSTBOWL AUTOMATED RADIO-TELEMETRY NETWORK (DARN) DATA DOWNLOAD AND ANALYSIS ############
+################## Jeremy D. Ross, University of Oklahoma #######################################
+
+#### Install necessary packages ####
+install.packages("remotes")
+install.packages("ggmap")
+install.packages("rworldmap")
+install.packages("tidyverse")
+install.packages("maps")
+install.packages("plyr")
+install.packages("gganimate")
+
+# Install necessary packages from Github using the devtools library #
+library(devtools)
+install_github("MotusWTS/motusData")# install motusData package which contains sample datasets, (e.g., vanishBearing) used in Chapter 7
+install_github("MotusWTS/motus") # install motus
+
+#### Load libraries ####
+library(remotes)
+library(motus)
+library(motusData)
+library(maps)
+library(tidyverse)
+library(rworldmap)
+library(ggmap)
+library(DBI)
+library(RSQLite)
+library(lubridate)
+library(dplyr)
+
+#### Set working environment ####
+
+Sys.setenv(TZ = "UTC")
+
+setwd("C:/Users/19189/OneDrive - University of Oklahoma/Winterbirds/AutomatedTelemetry/TagDetections")
+proj.num <- 129 #Motus project "University of Oklahoma" (#129)
+
+    #To check if data are available for your project or receiver without downloading the data
+    #tellme(projRecv = proj.num, dir = "./tag_data/")
+
+#### Download project data from Motus servers and create working copy ####
+sql.motus <- tagme(projRecv = proj.num, new = FALSE, forceMeta = FALSE, update = TRUE, 
+                   dir = "./tag_data/") #new = TRUE if downloading for first time; update = FALSE if loading offline from existing .motus file#use motusLogout() if you enter the wrong username or password 
+
+## CHECKPOINT - Examine downloaded table ##
+    # specify the filepath where your .motus file is saved, and the file name.
+    file.name <- dbConnect(SQLite(), paste0("./tag_data/project-",proj.num,".motus")) 
+    # get a list of tables in the .motus file specified above.
+    dbListTables(file.name) 
+    # get a list of variables in the "species" table in the .motus file.
+    dbListFields(file.name, "species") 
+
+# Extract an "alltags" table from the "sql.motus" SQLite file created earlier
+tbl.alltags <- tbl(sql.motus, "alltags") # virtual table
+
+## CHECKPOINT - Examine the extracted data
+    # To access to components of the underlying data frame use the collect() function. 
+    #example: variables in the alltags table:
+    tbl.alltags %>% 
+      collect() %>%
+      names() # list the variable names in the table
+    
+    #example: keep only the columns indicating the receiver id, antenna number, and tag ID assigned by Motus
+    df.alltagsSub <- tbl.alltags %>%
+      select(recv, port, motusTagID) %>%
+      distinct() %>% 
+      collect() %>% 
+      as.data.frame() 
+    
+    #Alternatively: use the alltagsGPS view (this can be slow, which is why GPS data is excluded by default):
+    #NOTE: this doesn't seem to provide information about which node (if applicable) detected the tag, nor its GPS location
+    tbl.alltagsGPS <- tbl(sql.motus, "alltagsGPS")
+    df.alltagsGPS <- tbl.alltagsGPS %>% ## This takes FOREVER if you don't filter down the dataset!!!
+      filter(!is.na(recvDeployName)) %>%
+      filter(tagDeployTest == 0) %>%  #Restricts data to non-test deployments
+      filter(recvSiteName == "Kiowa / Rita Blanca NG") %>%
+      filter(mfgID == "34610755") %>%
+      #select (tagProjID, ts, sig, port, mfgID, motusTagID, runLen, 
+      #        tagDepLat, tagDepLon, tagDeployID, recvDeployLat, recvDeployLon, recvDeployName, antBearing,gpsLat,gpsLon) %>%
+      collect() %>% 
+      as.data.frame() %>%     # for all fields in the df (data frame)
+      mutate(ts = as_datetime(ts, tz = "UTC", origin = "1970-01-01"))
+    names(df.alltagsGPS)
+
+#Flatten the virtual table into a dataframe
+df.alltags <- tbl.alltags %>%
+  filter(mfg == "CTT") %>%
+  filter(tagDeployTest == 0) %>%
+  collect() %>%
+  as.data.frame() %>%     # for all fields in the df (data frame)
+  mutate(ts = as_datetime(ts, tz = "UTC", origin = "1970-01-01"))
+
+    ##CHECKPOINT - check some metrics of the file:
+    names(df.alltags)     # field names
+    str(df.alltags)       # structure of your data fields
+    head(df.alltags)      # prints the first 6 rows of your df to the console
+    tail(df.alltags)      # prints the last 6 rows of your df to the console
+    summary(df.alltags)   # summary of each column in your df
+
+    #Count how many times each tag was detected at each station    
+    df.detectSum <- tbl.alltags %>% 
+      count(motusTagID, recvDeployName) %>%
+      collect() %>%
+      as.data.frame() 
+
+
+### Select and export the data from only the DARN receivers ###
+DARN.tags <- tbl.alltags %>%
+  #filter(mfgID %in% tags) %>%
+  filter(!is.na(recvDeployName)) %>%
+  filter(tagDeployTest == 0) %>%  #Restricts data to non-test deployments
+  #filter(runLen > 1) %>%
+  filter(recvSiteName == "Kiowa / Rita Blanca NG") %>%
+  select (tagProjID, ts, sig, port, mfgID, motusTagID, runLen, 
+        tagDepLat, tagDepLon, tagDeployID, recvDeployLat, recvDeployLon, recvDeployName, antBearing, tagDeployTest) %>%
+  collect() %>% 
+  as.data.frame() %>%    
+  mutate(ts = as_datetime(ts, tz = "UTC", origin = "1970-01-01"))
+
+
+    ##CHECKPOINT - Look at the most recent detections
+    tail(DARN.tags)      # prints the last 6 rows of your df to the console
+    
+    
+    ##Alternatively, keep only the detections OUTSIDE of the DARN
+    noDARN.tags <- tbl.alltags %>%
+      #filter(mfgID %in% tags) %>%
+      filter(mfg == "CTT") %>%
+      #filter(is.na(tagDepLat)) %>% #< 40) %>% #to eliminate the Montana deployments, as needed
+      #filter(runLen > 1) %>% # single pings are MUCH more likely to be false detections
+      filter(tagDeployTest == 0) %>%  #Restricts data to non-test deployments
+      filter(recvSiteName != "Kiowa / Rita Blanca NG") %>%
+      filter(recvSiteName != "American Prairie Reserve, MT") %>%
+      filter(recvSiteName != "Oklahoma Biological Survey") %>%
+      filter(recvSiteName != "CTT HQ") %>%
+      
+      #filter(mfgID == "782A4B52") %>%
+      #select (tagProjID, ts, sig, port, mfgID, motusTagID, runLen, 
+       #       tagDepLat, tagDepLon, tagDeployID, recvDeployLat, recvDeployLon, recvDeployName, antBearing) %>%
+      collect() %>% 
+      as.data.frame() %>%    
+      mutate(ts = as_datetime(ts, tz = "UTC", origin = "1970-01-01"))
+    
+write.csv(noDARN.tags,file= "./tag_data/SPPI2021_data.csv", row.names = FALSE)
+
+
+#Subset where tags transitioned between detections at different towers (not necessarily simultaneous detections)
+DARN.tags.trans <- DARN.tags %>%
+  arrange(motusTagID, ts,recvDeployName,desc(sig)) %>%       # order by time stamp for each tag
+  mutate(ts = as_datetime(ts, tz = "UTC")) %>% #, origin = "1970-01-01")) %>%    # create date variable
+  filter(recvDeployName != lag(recvDeployName)) %>%
+  group_by(motusTagID, tagDeployID, recvDeployName, 
+           tagDepLon, tagDepLat, recvDeployLat, recvDeployLon)
+
+#Subset where tags were detected within 5 seconds at different stations
+DARN.tags.simul <- DARN.tags %>%
+  arrange(motusTagID, ts,recvDeployName,desc(sig)) %>%       # order by time stamp for each tag
+  mutate(ts = as_datetime(ts, tz = "UTC")) %>% #, origin = "1970-01-01")) %>%    # create date variable
+  filter(recvDeployName != lag(recvDeployName)) %>%
+  filter(!is.na(antBearing)) %>% # This removes the node detections
+  mutate(ts = as_datetime(round(ts)+0,tz = "UTC")) %>%  #NOt sure if this is necessary. Do timestamps have decimals?
+  filter(ts - lag(ts) < 5| between (ts - lead(ts),-4.9,4.9)) %>%
+  group_by(motusTagID, tagDeployID, recvDeployName, 
+           tagDepLon, tagDepLat, recvDeployLat, recvDeployLon)
+
+#Subset where tags were detected within 5 seconds across at least 3 different stations
+window <- 4
+timespan <- c(-1,2) #All detections within a range of seconds
+DARN.tags.angulate <- DARN.tags.simul %>%
+  group_by(motusTagID) %>% #this is key for the lag/lead function used below
+  arrange(motusTagID, ts) %>% #just in case the order has been altered
+  filter(ts - lag(ts) < window & ts - lead(ts) > -window | (ts - lag(ts, n = 2)) < window | ts - lead(ts, n = 2) > -window) %>%
+  # time for BRUTE FORCE!!
+  mutate(lag.diff = lag.diff <- ts - lag(ts)) %>%
+  mutate(lag.diff2 = lag.diff2 <- ts - lag(ts, n = 2)) %>%
+  mutate(lag.diff3 = lag.diff3 <- ts - lag(ts, n = 3)) %>%
+  mutate(lag.diff4 = lag.diff4 <- ts - lag(ts, n = 4)) %>%
+  mutate(lag.diff5 = lag.diff5 <- ts - lag(ts, n = 5)) %>%
+  mutate(lag.diff6 = lag.diff6 <- ts - lag(ts, n = 6)) %>%
+  mutate(lag.diff7 = lag.diff7 <- ts - lag(ts, n = 7)) %>%
+  mutate(lag.diff8 = lag.diff8 <- ts - lag(ts, n = 8)) %>%
+  mutate(lag.diff9 = lag.diff9 <- ts - lag(ts, n = 9)) %>%
+  mutate(lag.diff10 = lag.diff10 <- ts - lag(ts, n = 10)) %>%
+  mutate(bin = cut(as.numeric(lag.diff), breaks = timespan)) %>%
+  mutate(bin2 = cut(as.numeric(lag.diff2), breaks = timespan)) %>%
+  mutate(bin3 = cut(as.numeric(lag.diff3), breaks = timespan)) %>%
+  mutate(bin4 = cut(as.numeric(lag.diff4), breaks = timespan)) %>%
+  mutate(bin5 = cut(as.numeric(lag.diff5), breaks = timespan)) %>%
+  mutate(bin6 = cut(as.numeric(lag.diff6), breaks = timespan)) %>%
+  mutate(bin7 = cut(as.numeric(lag.diff7), breaks = timespan)) %>%
+  mutate(bin8 = cut(as.numeric(lag.diff8), breaks = timespan)) %>%
+  mutate(bin9 = cut(as.numeric(lag.diff9), breaks = timespan)) %>%
+  mutate(bin10 = cut(as.numeric(lag.diff10), breaks = timespan)) %>%
+  collect() %>%
+  as.data.frame()
+
+DARN.tags.angulate.p1 <- DARN.tags.angulate %>%
+  filter(!is.na(bin)|!is.na(bin2)|!is.na(bin3)|!is.na(bin4)|!is.na(bin5)|!is.na(bin6)|!is.na(bin7)|!is.na(bin8)|!is.na(bin9)|!is.na(bin10)) %>%
+  mutate(ts = as_datetime((ts - 1), tz = "UTC")) %>%
+  collect() %>%
+  as.data.frame()
+
+DARN.tags.angulate.p2 <- DARN.tags.angulate %>%
+  filter(is.na(bin) & is.na(bin2) & is.na(bin3) & is.na(bin4) & is.na(bin5) & is.na(bin6) & is.na(bin7) & is.na(bin8) & !is.na(bin9) & !is.na(bin10)) %>%
+  mutate(ts = as_datetime(ts + 0, tz = "UTC")) %>%
+  collect() %>%
+  as.data.frame()
+
+DARN.tags.angulate.final <- rbind(DARN.tags.angulate.p1,DARN.tags.angulate.p2)
+rm(DARN.tags.angulate.p1,DARN.tags.angulate.p2)
+
+DARN.tags.angulate.final <- DARN.tags.angulate.final %>%
+  arrange(motusTagID, ts) %>%
+  mutate(ts = as_datetime(ts + 0, tz = "UTC")) %>%
+  select (tagProjID, ts, sig, mfgID, motusTagID, runLen, 
+          tagDepLat, tagDepLon, tagDeployID, recvDeployLat, recvDeployLon, recvDeployName, antBearing) %>%
+  mutate(timeToSunriset(.)) %>%
+  collect() %>%
+  as.data.frame()
+
+## Count for each 5s bout (or pool across a time series) of simultaneous detections
+
+angulated.tags <- DARN.tags.angulate.final %>%
+  arrange(motusTagID, ts) %>%
+  mutate(ts = round_date(ts, "5s")) %>%
+  count(motusTagID, ts) %>% #or use floor_date or ceiling_date, depending on what works
+  filter(n>2) %>% #limit to minimum number of simultaneous towers
+  mutate(recvDeployLat = 	36.37, recvDeployLon = -102.80) %>%
+  mutate(timeToSunriset(.)) %>%
+  collect() %>%
+  as.data.frame()
+
+#### GOTTA BE AN EASIER WAY TO POOL ALL THESE DETECTIONS WITHIN 5-MIN!! ####
+#  Need to compare each row to subsequent ones until the difference between the first row and the last row exceeds 5-minutes
+#  Then need to figure out how many unique towers were pinged within that time frame and, for each, what the maximum signal strength was
+window <- 300
+timespan <- c(-1,300) #All detections within a range of seconds
+angulated.tags.5min <- angulated.tags %>%
+  group_by(motusTagID) %>% #this is key for the lag/lead function used below
+  arrange(motusTagID, ts) %>% #just in case the order has been altered
+  filter(ts - lag(ts) < window & ts - lead(ts) > -window | (ts - lag(ts, n = 2)) < window | ts - lead(ts, n = 2) > -window) %>%
+  # time for BRUTE FORCE!!
+  mutate(lag.diff = lag.diff <- ts - lag(ts)) %>%
+  mutate(lag.diff2 = lag.diff2 <- ts - lag(ts, n = 2)) %>%
+  mutate(lag.diff3 = lag.diff3 <- ts - lag(ts, n = 3)) %>%
+  mutate(lag.diff4 = lag.diff4 <- ts - lag(ts, n = 4)) %>%
+  mutate(lag.diff5 = lag.diff5 <- ts - lag(ts, n = 5)) %>%
+  mutate(lag.diff6 = lag.diff6 <- ts - lag(ts, n = 6)) %>%
+  mutate(lag.diff7 = lag.diff7 <- ts - lag(ts, n = 7)) %>%
+  mutate(lag.diff8 = lag.diff8 <- ts - lag(ts, n = 8)) %>%
+  mutate(lag.diff9 = lag.diff9 <- ts - lag(ts, n = 9)) %>%
+  mutate(lag.diff10 = lag.diff10 <- ts - lag(ts, n = 10)) %>%
+  mutate(bin = cut(as.numeric(lag.diff), breaks = timespan)) %>%
+  mutate(bin2 = cut(as.numeric(lag.diff2), breaks = timespan)) %>%
+  mutate(bin3 = cut(as.numeric(lag.diff3), breaks = timespan)) %>%
+  mutate(bin4 = cut(as.numeric(lag.diff4), breaks = timespan)) %>%
+  mutate(bin5 = cut(as.numeric(lag.diff5), breaks = timespan)) %>%
+  mutate(bin6 = cut(as.numeric(lag.diff6), breaks = timespan)) %>%
+  mutate(bin7 = cut(as.numeric(lag.diff7), breaks = timespan)) %>%
+  mutate(bin8 = cut(as.numeric(lag.diff8), breaks = timespan)) %>%
+  mutate(bin9 = cut(as.numeric(lag.diff9), breaks = timespan)) %>%
+  mutate(bin10 = cut(as.numeric(lag.diff10), breaks = timespan)) %>%
+  collect() %>%
+  as.data.frame()
+
+hist(angulated.tags$n, breaks = c(2:9))
+
+### Extract the time of day for each detection ###
+
+#Time since sunrise
+hist(DARN.tags.angulate.final$ts_since_rise[ !DARN.tags.angulate.final$ts_since_rise>12 ], breaks = 24)
+hist(angulated.tags$ts_since_rise[ !angulated.tags$ts_since_rise>12 ], breaks = 24) #subset
+
+#Time until sunset
+hist(DARN.tags.angulate.final$ts_to_set[ !DARN.tags.angulate.final$ts_to_set>12 ], breaks = 24)
+hist(angulated.tags$ts_to_set[ !angulated.tags$ts_to_set>12 ], breaks = 24) #subset
+
+library(quantreg)
+plot(angulated.tags$ts_since_rise,angulated.tags$n)
+
+rqfit <- rq(ts_since_rise ~ n, data = angulated.tags)
+summary(rqfit)
+
+multi.rqfit <- rq(ts_since_rise ~ n, data = angulated.tags, tau = seq(0, 1, by = 0.1))
+summary(multi.rqfit)
+
+# plotting different quantiles
+colors <- c("#ffe6e6", "#ffcccc", "#ff9999", "#ff6666", "#ff3333",
+            "#ff0000", "#cc0000", "#b30000", "#800000", "#4d0000", "#000000")
+plot(ts_since_rise ~ n, data = angulated.tags, pch = 16, main = "time since sunrise ~ no. towers")
+for (j in 1:ncol(multi.rqfit$coefficients)) {
+  abline(coef(multi.rqfit)[, j], col = colors[j])
+}
+
+
+#### Individual dataset extraction ####
+#NEED TO MAKE A LOOP TO PLOT FOR EACH BIRD or AS ALL BIRDS COLOR CODED #
+
+#tags <- c("34333433")           #"4C52074B","344C2D2D","34333433","1E193434","78330752","341E6133")
+tags <- unique(DARN.tags$mfgID)
+
+for (x in tags){
+  print(x)
+  write.csv(subset(DARN.tags, mfgID == x), file = paste0("./Ind_data/",x,"_2020.21_data.csv"))
+}
+
+## To read the CSV files of specified individual(s) use the following
+library(readr)
+# Pick from list below
+retrieve.tags <- c("34610755","6655551E")#,"61780778","34616678","614B7878","344B2D4C","34333433","344B1961","784C6161","78330752","2D1E6155","66613319","3434612A","34336152","332D2A19","0734614C","341E6133","614B342D","341E5578","1E193434","344C2D2D","52196133","522D1E07","78557878","552D0761","4C2A3319","4C52074B","19784C52","5207664C","614C0761","2A612A55","661E2D52","331E3419","34784B2D","55077861","19552D55","61336655","784C0707")
+name <- NULL
+
+for (r in retrieve.tags){ #This loop will create a separate dataframe for each listed in "retrieve.tags"
+  print(r)
+  name <- paste0("X",r,"_data")
+  assign(as.character(name),read_csv(paste0("./Ind_data/",r,"_2020.21_data.csv"),
+                   col_types = cols(ts = col_datetime(format = "%Y-%m-%d %H:%M:%S"))))
+}
+
+
+#### Map the detections ####
+
+df.alltags.path <- fun.getpath(DARN.tags.path)
+
+gmap <-  get_stamenmap(bbox = c(left = -103.2, right = -102.1, bottom = 36.2, top = 36.6),
+                       maptype = "terrain-background", # select maptype
+                       zoom = 12) # zoom, must be a whole number
+#plot(gmap) #to check extent first
+
+df.tmp <- DARN.tags.path %>%
+  # filter(motusTagID %in% c(16011, 16035, 16036, 16037, 16038, 16039)) %>% #if you have more than one tag
+  arrange(ts)  %>% # arange by hour
+  as.data.frame()
+
+library(scales)
+ggmap(gmap) +
+  theme_bw() + 
+  ggtitle(unique(df.tmp$mfgID)) +
+  geom_point(data = df.tmp, aes(x = recvDeployLon, y = recvDeployLat), 
+             shape = 21, colour = "black", fill = "yellow") +
+  geom_path(data = df.tmp, 
+            aes(x = recvDeployLon, y = recvDeployLat, group = motusTagID, col = ts), 
+            arrow = arrow(type = "open", angle = 30, ends = "last",length = unit(0.05, "inches"))) + # as.factor(motusTagID))) + #use motusTagID if more than one
+  scale_color_gradientn("Date", colours = rainbow(10), trans = time_trans())
+
+
+#Map the detections
+fun.getpath <- function(df) {
+  df %>%
+    filter(tagProjID == proj.num, # keep only tags registered to the sample project
+           !is.na(recvDeployLat) | !(recvDeployLat == 0)) %>% 
+    group_by(motusTagID, tagDeployID, recvDeployName, 
+             tagDepLon, tagDepLat, recvDeployLat, recvDeployLon) %>%
+    summarize(max.runLen = max(runLen), ts.h = mean(ts)) %>%
+    arrange(motusTagID, ts.h) %>%
+    data.frame()
+} # end of function call
+
+df.alltags.path <- fun.getpath(DARN.tags)
+
+#Alternate?
+DARN.tags.path <- DARN.tags %>%
+  filter(tagProjID == proj.num) %>% # only tags registered to project
+  arrange(motusTagID, ts,recvDeployName,desc(sig)) %>%       # order by time stamp for each tag
+  mutate(ts = as_datetime(ts, tz = "UTC")) %>% #, origin = "1970-01-01")) %>%    # for some reason setting the 'origin' has started to kick an error
+  group_by(motusTagID, tagDeployID, recvDeployName, 
+           tagDepLon, tagDepLat, recvDeployLat, recvDeployLon)
+### Making an animated plot of movements ###
+
+# First plot the points without animation
+
+ggmap(gmap) +
+  theme_bw() + 
+  ggtitle(unique(df.tmp$mfgID)) +
+  geom_point(data = df.tmp, aes(x = recvDeployLon, y = recvDeployLat), 
+             shape = 21, colour = "black", fill = "yellow") +
+  geom_point(data = df.tmp, 
+            aes(x = recvDeployLon, y = recvDeployLat, group = motusTagID, col = ts)) +
+  scale_color_gradientn("Date", colours = rainbow(10), trans = time_trans())
+
+library(gganimate)
+theme_set(theme_bw())
+
+p <- ggplot(
+  df.tmp, 
+  aes(x = recvDeployLon, y=recvDeployLat, group = motusTagID, col = ts)
+) +
+  geom_point(show.legend = FALSE, alpha = 0.7) +
+  scale_color_gradientn("Date", colours = rainbow(10), trans = time_trans()) +
+  scale_size(2)
+p
+
+p + transition_time(ts) +
+  labs(title = "Datetime: {as.Date(ts)}")
+
+#### TO DO #####
+
+#1 Extract all detections from same individual across different stations within 1-minute of each other
+
+##DONE#2 Subset all SIMULTANEOUS detections (i.e., within 5s) at different towers
+
+#2 Adapt localization code for nodes to analyze approx position of birds simuldetected by 3+ towers
+
+#3 Use known locations from waterhole surveys to calibrate vector estimation for simultaneous detections
+
+#4  Produce all-sites residency graph for all individuals
+
+#5  Highlight days when individuals departed the DARN area and weren't detected again for at least 3 days
+
+#6  Explore whether RSSI of different antennas of same station can be used to adequately estimate distance and bearing
