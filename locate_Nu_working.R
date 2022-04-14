@@ -1,6 +1,11 @@
 #Edited by Nu Perera
 #email: nuperera@ou.edu
 
+install.packages('rgdal', type = "source", configure.args=c(
+'--with-gdal-config=/Library/Frameworks/GDAL.framework/Programs/gdal-config', 
+'--with-proj-include=/Library/Frameworks/PROJ.framework/Headers', 
+'--with-proj-lib=/Library/Frameworks/PROJ.framework/unix/lib'))
+
 install.packages("raster")
 library(raster)
 library(sp)
