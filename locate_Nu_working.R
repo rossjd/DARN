@@ -2,11 +2,17 @@
 #email: nuperera@ou.edu
 
 install.packages('rgdal', type = "source", configure.args=c(
-'--with-gdal-config=/Library/Frameworks/GDAL.framework/Programs/gdal-config', 
-'--with-proj-include=/Library/Frameworks/PROJ.framework/Headers', 
-'--with-proj-lib=/Library/Frameworks/PROJ.framework/unix/lib'))
+  '--with-gdal-config=/Library/Frameworks/GDAL.framework/Programs/gdal-config', 
+  '--with-proj-include=/Library/Frameworks/PROJ.framework/Headers', 
+  '--with-proj-lib=/Library/Frameworks/PROJ.framework/unix/lib'))
 
-install.packages("raster")
+install.packages("raster","datasets", "optimx", "dfoptim", "mgcv", "arm","segmented")
+install.packages("boot")
+install.packages("quantreg")
+install.packages("rgdal")
+update.packages("rgdal")
+install.packages("rsq")
+install.packages("MumIn")
 library(raster)
 library(sp)
 library(rgdal)
@@ -23,14 +29,31 @@ library(scales)
 library(tidyr)
 library(motus)
 library(motusData)
+library(boot)
+library(lme4)
+library(quantreg)
+library(cowplot)
+library(car)
+library(MASS)
+library(datasets)
+library(lme4)
+library(optimx)
+library(dfoptim)
+library(mgcv)
+library(arm)
+library(nlme)
+library(segmented)
+library(rsq)
+library(MuMIn)
 
-setwd("C:/Users/19189/OneDrive - University of Oklahoma/Winterbirds/AutomatedTelemetry/TagDetections")
+
+setwd("/Users/gamageperera/Desktop/Motus/Motus")
 source("data_tools_master/functions/data_manager.R")
 source("data_tools_master/functions/localization.R")
 
 
 ###EDIT THESE VALUES
-infile <- "E:/Winterbirds/tag_detections/Sensorstations/Tumbleweed_working/F21E1A341DB5"
+infile <- "/Users/gamageperera/Desktop/Motus/Motus/data_tools_master/Winterbirds/tag_detections/Sensorstations/Tumbleweed_working/F21E1A341DB5"
 outpath <- "./node_output/"
 
 all_data <- load_data(infile)
@@ -44,10 +67,16 @@ nodes <- node_file(all_data[[2]][[1]])
 nodes$NodeId <- toupper(nodes$NodeId)
 write.csv(nodes,file = "./nodes.csv" )
 #nodes <- read.csv("./nodes.csv", as.is=TRUE, na.strings=c("NA", ""), strip.white=TRUE) #IF NEEDED
+str(nodes)
+head(nodes)
 
 beep_data <- beep_data[beep_data$NodeId %in% nodes$NodeId,] #c("326317", "326584", "3282fa", "3285ae", "3288f4") #make sure Node list is consistent
+beep_data<- readRDS("beep_data")
+unique(beep_data$TagId)
+beep_data[!complete.cases(beep_data),]
 
-tags <- read.csv("./tags-to-analyze.csv", as.is=TRUE, na.strings=c("NA", "")) #uppercase node letters
+
+tags <- read.csv("./data_tools_master/CSV_files_for_node_data_analysis/tags-to-analyze.csv", as.is=TRUE, na.strings=c("NA", "")) #uppercase node letters
 #filter(Validated ==1)
 
 #tags<-tags[!duplicated(tags$TagId),]
@@ -61,7 +90,10 @@ freq <- c("3 min", "10 min")
 #freq<- c("1 min")
 
 max_nodes <- 0 #how many nodes should be used in the localization calculation?
-df <- merge_df(beep_data, nodes, tag_id, latlng = TRUE)
+df <- merge_df(beep_df=beep_data, node_df=nodes, tag_id=tag_id, latlng = TRUE)
+
+unique(tags$TagId)
+unique(df$TagId)
 
 resampled <- advanced_resampled_stats(beeps = beep_data, node = nodes, freq = freq[1], tag_id = tag_id)
 #removing N/A tagRSSI
@@ -114,27 +146,375 @@ actbud$NodeId=gsub("329934","S5",actbud$NodeId)
 
 actbud
 
-#Splitting date and time
-actbud<- actbud %>%
-  separate (freq, c("Date", "Time"), " ")
-actbud
+head(resampled)
+str(resampled)
 
-freq_sum2<- actbud %>%
-  filter(TagId==61780778) %>%
-  group_by(Time)
+datetime1 <- as.POSIXct("2021-01-22 14:45:23", tz="UTC")
 
-ggplot(data = filter(actbud, TagId == 61780778, 
-                     Time > ("13:00:00"),
-                     Time < ("23:58:00")),
-       aes(x = Time, y = beep_count, col = as.factor(NodeId))) +
+
+#getSunTimes(timeUTC=datetime1, lat = 36.4, lon = -102.5)
+#actbud.sub<- resampled %>%
+  #mutate(getSunTimes(.))%>%
+  #collect()%>%
+  #as.data.frame()
+
+actbud.sub<-resampled%>%
+  mutate(ts=as.numeric(freq))
+
+
+
+#Time to sunriseset
+actbud.sub <- actbud.sub %>%
+  arrange(TagId, ts) %>%
+  mutate(ts = as_datetime(ts + 0, tz = "UTC")) %>%
+  dplyr::select (TagId, ts, NodeId, node_lat_mode, node_lng_mode, beep_count) %>%
+  filter(!is.na(node_lat_mode), !is.na(node_lng_mode))%>%
+  mutate(timeToSunriset(data = actbud.sub, lat="node_lat_mode", lon="node_lng_mode", ts="ts", units="hours")) %>%
+  collect() %>%
+  as.data.frame()
+str(actbud.sub)
+write.csv(actbud.sub,file = "./actbud.sub.csv" )
+
+### Extract the time of day for each detection ###
+
+#Time since sunrise
+hist(actbud.sub$ts_since_rise[ !actbud.sub$ts_since_rise>12 ], breaks = 24)
+#hist(actbud.subs$ts_since_rise[ !actbud.sub$ts_since_rise>12 ], breaks = 24) #subset
+
+#Time until sunset
+hist(actbud.sub$ts_to_set[ !actbud.sub$ts_to_set>12 ], breaks = 24)
+#hist(angulated.tags$ts_to_set[ !angulated.tags$ts_to_set>12 ], breaks = 24) #subset
+
+hist(actbud.sub$ts_since_rise[!actbud.sub$TagId == 61780778], breaks =24)
+plot(actbud.sub$ts_since_rise,actbud.sub$beep_count)
+
+
+#rqfit <- rq(ts_since_rise ~ n, data = actbud.sub)
+#summary(rqfit)
+
+#multi.rqfit <- rq(ts_since_rise ~ n, data = angulated.tags, tau = seq(0, 1, by = 0.1))
+#summary(multi.rqfit)
+
+
+#Plotting each individual separately
+ggplot(data = actbud.sub, aes(x=ts, y = beep_count, color=beep_count)) +
+  geom_point() +
+  facet_wrap(facets = vars(TagId))
+
+actbud.sub$NodeId=gsub("3287DE","W1",actbud.sub$NodeId)
+actbud.sub$NodeId=gsub("328C94","W2",actbud.sub$NodeId)
+actbud.sub$NodeId=gsub("328C26","W3",actbud.sub$NodeId)
+actbud.sub$NodeId=gsub("328591","W4",actbud.sub$NodeId)
+actbud.sub$NodeId=gsub("328497","W5",actbud.sub$NodeId)
+actbud.sub$NodeId=gsub("32624B","N1",actbud.sub$NodeId)
+actbud.sub$NodeId=gsub("328A8E","N2",actbud.sub$NodeId)
+actbud.sub$NodeId=gsub("328147","N3",actbud.sub$NodeId)
+actbud.sub$NodeId=gsub("325D6E","N4",actbud.sub$NodeId)
+actbud.sub$NodeId=gsub("32926A","N5",actbud.sub$NodeId)
+actbud.sub$NodeId=gsub("328E58","E1",actbud.sub$NodeId)
+actbud.sub$NodeId=gsub("329306","E2",actbud.sub$NodeId)
+actbud.sub$NodeId=gsub("325D80","E3",actbud.sub$NodeId)
+actbud.sub$NodeId=gsub("325EAA","E4",actbud.sub$NodeId)
+actbud.sub$NodeId=gsub("328D8E","E5",actbud.sub$NodeId)
+actbud.sub$NodeId=gsub("328B4C","S1",actbud.sub$NodeId)
+actbud.sub$NodeId=gsub("325CF3","S2",actbud.sub$NodeId)
+actbud.sub$NodeId=gsub("327C23","S3",actbud.sub$NodeId)
+actbud.sub$NodeId=gsub("3263FF","S4",actbud.sub$NodeId)
+actbud.sub$NodeId=gsub("329934","S5",actbud.sub$NodeId)
+
+#looking at beep count with sunrise and sunset
+ggplot(data = filter(actbud.sub, TagId == 61780778, 
+                     ts > ("2021-01-20 15:06:00"),
+                     ts < ("2021-03-28 14:39:000")),
+       aes(x = ts, y = beep_count, col = as.factor(NodeId))) +
   theme_bw() + 
   geom_point() + 
   labs(title = "TagID 61780778", x = "Time of day", y = "Beep count") +
   scale_color_discrete(name = "NodeId") +
   facet_grid(NodeId ~ .) 
 
+ggplot(data = filter(actbud.sub, TagId == 61780778), 
+       aes(x = ts, y = beep_count)) +
+  theme_bw() + 
+  geom_point() + 
+  labs(x = "Time of year", y = "Beep count") +
+  geom_vline(aes(xintercept = sunrise), col = "orange") + 
+  geom_vline(aes(xintercept = sunset), col = "blue")
+
+#time to sunrise and sunset each month
+p9<- ggplot(data = filter(actbud.sub, TagId == 61780778,
+                     ts > ("2021-01-20 15:06:00"),
+                     ts < ("2021-01-31 22:39:00")), 
+       aes(x = ts, y = beep_count)) +
+  theme_bw() + 
+  geom_point() + 
+  labs(x = "Time of year", y = "Beep count") +
+  geom_vline(aes(xintercept = sunrise), col = "orange") + 
+  geom_vline(aes(xintercept = sunset), col = "blue")
+
+p10<- ggplot(data = filter(actbud.sub, TagId == 61780778,
+                     ts > ("2021-02-01 14:39:00"),
+                     ts < ("2021-02-28 23:21:00")), 
+       aes(x = ts, y = beep_count)) +
+  theme_bw() + 
+  geom_point() + 
+  labs(x = "Time of year", y = "Beep count") +
+  geom_vline(aes(xintercept = sunrise), col = "orange") + 
+  geom_vline(aes(xintercept = sunset), col = "blue")
+
+p11<- ggplot(data = filter(actbud.sub, TagId == 61780778,
+                     ts > ("2021-03-01 14:57:00"),
+                     ts < ("2021-03-28 14:39:00")), 
+       aes(x = ts, y = beep_count)) +
+  theme_bw() + 
+  geom_point() + 
+  labs(x = "Time of year", y = "Beep count") +
+  geom_vline(aes(xintercept = sunrise), col = "orange") + 
+  geom_vline(aes(xintercept = sunset), col = "blue")
+
+plot_grid(p9, p10, p11, labels = "AUTO")
+
+#beep counts from sunrise and sunset
+ggplot(data=actbud.sub, aes(x = ts_since_rise, y = beep_count, color = beep_count)) +
+  geom_line() +
+  facet_wrap(facets = vars(TagId))
+
+unique(actbud.sub$TagId)
+unique(actbud$TagId)
+unique(resampled$TagId)
+unique(df$TagId)
+unique(tags$TagId)
+
+
+#beep counts since sunrise and time to sunset
+sp<- ggplot(data=actbud.sub, aes(x = ts_since_rise, y = beep_count, color = beep_count))+
+  geom_point() +
+  facet_wrap(facets = vars(TagId))
+sp+scale_color_gradient(low = "blue", high = "orange")
+
+sp2<-ggplot(data=actbud.sub, aes(x = ts_to_set, y = beep_count, color = beep_count)) +
+  geom_point() +
+  facet_wrap(facets = vars(TagId))
+sp2+scale_color_gradient(low = "cyan3", high = "coral")
+
 #sum of beep count across all nodes vs time
-actbud1<- actbud %>%
+actbud.sub1<- actbud.sub %>%
+  group_by(ts_since_rise)%>%
+  summarise(count=n(), beep_count=sum(beep_count))
+
+ggplot(data = filter(actbud.sub1, 
+                     ts_since_rise > ("0.161282443"),
+                     ts_since_rise < ("11.6068066")),
+       aes(x = ts_since_rise, y = count, col = as.factor(count))) + #beep_count instead?
+  theme(legend.position="none") + 
+  geom_point() + 
+  labs(title = "TagID 61780778", x = "Time since sunrise", y = "Beep count")
+
+#Add day length to the data set
+daylength(lat=36.48946, doy= 2021-01-20) #14.65317
+daylength(lat=36.48946, doy= 2021-02-20) #14.65447
+daylength(lat=36.48946, doy= 2021-03-20) #14.6549
+
+actbud.sub$beep_count.t<-actbud.sub$beep_count +1
+qqp(actbud.sub$beep_count.t, "norm")
+qqp(actbud.sub$beep_count.t, "lnorm") #log normal
+
+#qqp requires estimates of the parameters of the negative binomial, Poisson
+# and gamma distributions. You can generate estimates using the fitdistr
+# function. 
+nbinom <- fitdistr(actbud.sub$beep_count.t, "Negative Binomial")
+qqp(actbud.sub$beep_count.t, "nbinom", size = nbinom$estimate[[1]], mu = nbinom$estimate[[2]])
+
+gamma <- fitdistr(actbud.sub$beep_count.t, "gamma")
+qqp(actbud.sub$beep_count.t, "gamma", shape = gamma$estimate[[1]], rate = gamma$estimate[[2]])
+
+#bootstrapping method
+# function to obtain R-Squared from the data
+rsq <- function(formula, data, indices) {
+  d <- data[indices,] # allows boot to select sample
+  fit <- lmer(formula, data=d)
+  return(fixef(fit)[2])
+}
+# bootstrapping with 1000 replications
+results <- boot(data=actbud.sub, statistic=rsq,
+                R=1000, formula=beep_count~ts_since_rise+(1|TagId))
+
+test<-lme4::lmer(formula=beep_count~ts_since_rise+(1|TagId), data=actbud.sub)
+summary(test)
+str(test)
+fixef(test)[2]
+
+# view results
+results
+plot(results)
+
+# get 95% confidence interval
+boot.ci(results, type="bca")
+
+#species models
+actbud.sub$TagId<-as.factor(actbud.sub$TagId)
+md<- gamm(beep_count ~ s(ts_since_rise, fx= FALSE, bs = "tp")+ s(TagId, bs ="re"),
+          family = poisson,
+          data=actbud.sub)
+summary(md$gam)
+summary(md$lme)
+plot(md$gam)
+
+
+md_gp <- as.data.frame(predict(md$gam, re.form = TRUE, se = TRUE, type = "response", exclude = s(TagId)))
+md_pred <- cbind(actbud.sub, md_gp)
+
+ggplot(md_pred) +
+  geom_line(aes(beep_count, fit)) +
+  geom_ribbon(data = actbud.sub, aes(x = ts_since_rise, ymin = (fit - 2*se.fit), ymax = (fit + 2*se.fit)), linetype = 2, alpha = 0.2) +
+  theme_bw() +
+  labs(x = "", y = "", title = "") +
+  theme(plot.title = element_text(size = 20, hjust = 0.5))
+
+
+
+#Poisson regression modeling for count data
+hist(actbud.sub$beep_count)
+mean(actbud.sub$beep_count) #calculate mean
+var(actbud.sub$beep_count) #calculate variance
+#since the variance is much greater than mean, it suggest that data has an over-dispersion in the model
+
+# model poisson regression using glm()
+poisson.model<- glmer(beep_count ~ ts_since_rise + (1| TagId), actbud.sub,
+                      family = poisson(link = "log"))
+
+
+fm1.all <- allFit(poisson.model)
+summary(fm1.all)
+
+summary(poisson.model)
+plot(poisson.model)
+
+poisson.model2<- glm(beep_count ~ ts_since_rise + TagId, data = actbud.sub, family = quasipoisson(link = "log"))
+summary(poisson.model2)
+
+poisson.model3<- glm(beep_count ~ ts_since_rise +TagId, data = actbud.sub, family = "poisson")
+summary(poisson.model3)
+
+#generalized additive models
+mod.lm<-lm(beep_count~ts_since_rise, data=actbud.sub)
+mod.quad<- lm(beep_count~ts_since_rise +I(ts_since_rise), data=actbud.sub)
+mod.gam<- gam(beep_count~ s(ts_since_rise), data= actbud.sub)
+
+AIC(mod.lm, mod.quad, mod.gam)
+anova(mod.lm, mod.quad, mod.gam, test="F")
+
+pois.glm = glm(beep_count ~ ts_since_rise + TagId, data=actbud.sub, family=c("poisson"))  
+pois.gam = gam(beep_count ~ ts_since_rise + s(TagId), data= actbud.sub, family=c("poisson"))  
+
+pois.gam.quasi = gam(beep_count ~ ts_since_rise + s(TagId), data=actbud.sub, family=c("quasipoisson"))  
+pois.gam.nb = gam(leaves ~ year + s(degdays), data=dat, family=nb())  
+   
+
+
+# extract coefficients from first model using 'coef()'
+coef1 = coef(poisson.model)
+
+# extract coefficients from second model
+coef2 = coef(poisson.model2)
+
+# extract standard errors from first model using 'se.coef()'
+se.coef1 = se.coef(poisson.model)
+
+# extract standard errors from second model
+se.coef2 = se.coef(poisson.model2)
+
+# use 'cbind()' to combine values into one dataframe
+models.both<- cbind(coef1, se.coef1, coef2, se.coef2, exponent = exp(coef1))
+
+# show dataframe
+models.both
+
+#I cannot use linear mixed model fit by maximum likelihood because my data is not distributed normally
+#therefore, first I need to test whether I can penalized quasilikelihood (PQL) or not
+#PQL is a flexible technique that can deal with non-normal data, unbalanced design and crossed random effects.
+
+
+PQL <- glmmPQL(beep_count.t ~ ts_since_rise + TagId, ~1 | NodeId/TagId, family = gaussian(link = "log"),
+               data = actbud.sub, verbose = FALSE)
+
+
+
+#determining the threshold of the ts_since_sunrise which birds start to be active
+fit<-lm(beep_count~ts_since_rise, data = actbud.sub)
+plot(fit, which=1, add.smooth= FALSE) #which=1 argument tells to produce residuals vs fitted values plot
+plot(fit, which=1, add.smooth= TRUE) #add.smooth add a line called "loess smooth"
+plot(fit, which=2) #plot a normal probability diagnostic
+plot(fit, add.smooth=FALSE, which=3) #assess the constant variance assumption
+
+#bartlett.test(beep_count~ts_since_rise, data=actbud.sub)
+
+segmented.ft<-segmented(fit, seg.Z = ~ ts_since_rise, fixed.psi = NULL)
+summary(segmented.ft)
+plot(actbud.sub$ts_since_rise, actbud.sub$beep_count)
+#add segmented regression model
+plot(segmented.ft, add=T, col = "red")
+
+#Linear regression model
+summary(fit)
+ggplot(data=actbud.sub, aes(x = ts_since_rise, y = beep_count, color = beep_count)) +
+  geom_point() +
+  geom_smooth(method="lm", se=FALSE, colour="Yellow")+
+  theme_minimal()+
+  labs(x='Time since sunrise', y='Beep count', title='Linear Regression Plot') +
+  theme(plot.title = element_text(hjust=0.5, size=20, face='bold')) 
+
+#linear mixed effects model
+actbud.mixed<-lmer(beep_count~ts_since_rise + (1 | TagId) +(1|NodeId), data = actbud.sub)
+summary(actbud.mixed)
+
+(mm_plot <- ggplot(actbud.sub, aes(x = ts_since_rise, y = beep_count, colour = TagId)) +
+    facet_wrap(~TagId, nrow=2) +   
+    geom_point(alpha = 0.5) +
+    theme_classic() +
+    geom_line(data = cbind(actbud.sub, pred = predict(actbud.mixed)), aes(y = beep_count), size = 1) +  # adding predicted line from mixed model 
+    theme(legend.position = "none",
+          panel.spacing = unit(2, "lines"))  # adding space between panels
+)
+
+anova(actbud.mixed)
+
+
+actbud.mixed<-lmer(beep_count~ts_since_rise + (1 | TagId), data = actbud.sub)
+summary(actbud.mixed)
+#confidence interval
+confint(actbud.mixed)
+#estimates of the random effects
+ranef(actbud.mixed)$TagId %>% head(5)
+#-------------------------------------------------------------------------------------------
+#Not accurate to split freq column to date and time, it split as a chr
+#Splitting date and time
+actbud_split<- actbud %>%
+  separate (freq, c("Date", "Time"), " ")
+actbud_split
+
+actbud_split<-resampled%>%
+  mutate(ts=as.numeric(freq))
+str(actbud_split$Time)
+
+
+freq_sum2<- actbud_split %>%
+  filter(TagId==61780778) %>%
+  group_by(Time)
+
+
+ggplot(data = filter(actbud_split, TagId == 61780778, 
+                     Time > ("13:00:00"),
+                     Time < ("23:58:00")),
+       aes(x = Time, y = beep_count, col = as.factor(NodeId))) +
+  theme_bw() + 
+  geom_point() + 
+  labs(title = "TagID 61780778", x = "Time of day", y = "Beep count") +
+  scale_color_discrete(name = "NodeId") + theme(axis.text.x = element_text(angle = 90))
+  facet_grid(NodeId ~ .) 
+
+#sum of beep count across all nodes vs time
+actbud1<- actbud_split %>%
   group_by(Time)%>%
   summarise(count=n(), beep_count=sum(beep_count))
 
@@ -152,180 +532,24 @@ ggplot(data = filter(actbud1,
   geom_point() + 
   labs(title = "TagID 61780778", x = "Time of day", y = "Beep count")
 
-
-
-
-#
 actbud2<-actbud1%>%
   filter(Time>"13:00:00")
+str(actbud2$Time)
 
 ggplot(data=actbud2, mapping = aes(x=Time, y=beep_count))+
   theme(panel.grid.minor.y=element_blank(), panel.grid.major.y=element_blank())+
   theme(panel.grid.minor.x=element_blank(),panel.grid.major.x=element_blank())+
+  scale_x_continuous(breaks = as)
   geom_point()
 
 #Plotting each individual separately
-ggplot(data = actbud, aes(x=Time, y = beep_count)) +
+ggplot(data = actbud_split, aes(x=Time, y = beep_count, color = beep_count)) +
   geom_point() +
   facet_wrap(facets = vars(TagId))
 
 
-#adding sunrise
-str(resampled)
-
-resampled<-resampled%>%
-  dplyr::rename_with("freq"="ts")
-
-install.packages("lutz")
-library(lutz)
-actbud.tags <- resampled %>%
-  arrange(TagId, freq) %>%
-  mutate(freq = round_date(freq, "3 min")) %>% 
-  count(TagId, freq) %>% #or use floor_date or ceiling_date, depending on what works
-  mutate(node_lat_mode = 	36.37, node_lng_mode = -102.80) %>%
-  dplyr::mutate(motus::sunRiseSet(.)) 
-collect() %>%
-  as.data.frame()
-
-
-#actbud.sub<-sunriset(resampled, lat="node_lat_mean", lon="node_lng_mean")
-#Kate used "move" package to get solar day and night
-#part of the motus package
-#mutate(recvDeployLat = 	36.37, recvDeployLon = -102.80) %>%
-#mutate(timeToSunriset(.)) %>%
-#DARN.tags.angulate.final <- DARN.tags.angulate.final %>%
-#arrange(motusTagID, ts) %>%
-# mutate(ts = as_datetime(ts + 0, tz = "UTC")) %>%
-# select (tagProjID, ts, sig, mfgID, motusTagID, runLen, 
-#  tagDepLat, tagDepLon, tagDeployID, recvDeployLat, recvDeployLon, recvDeployName, antBearing) %>%
-#  mutate(timeToSunriset(.)) %>%
-# collect() %>%
-# as.data.frame()
-
-DARN.tags.angulate.final <- rbind(DARN.tags.angulate.p1,DARN.tags.angulate.p2)
-rm(DARN.tags.angulate.p1,DARN.tags.angulate.p2)
-
-DARN.tags.angulate.final <- DARN.tags.angulate.final %>%
-  arrange(motusTagID, ts) %>%
-  mutate(ts = as_datetime(ts + 0, tz = "UTC")) %>%
-  select (tagProjID, ts, sig, mfgID, motusTagID, runLen, 
-          tagDepLat, tagDepLon, tagDeployID, recvDeployLat, recvDeployLon, recvDeployName, antBearing) %>%
-  mutate(timeToSunriset(.)) %>%
-  collect() %>%
-  as.data.frame()
-
 #-------------------------------------------------------------------------------------------------------------
 
-df.alltags.sub <- sunRiseSet(df.alltags, lat = "recvDeployLat", lon = "recvDeployLon") 
-geom_vline(aes(xintercept = sunrise), col = "orange") + 
-  geom_vline(aes(xintercept = sunset), col = "blue")
-
-ggplot(data = filter(actbud, TagId == 61780778, 
-                     freq > ("2021-03-26 19:33:00"),
-                     freq < ("2021-03-27 19:18:00")),
-       aes(x = freq, y = beep_count, col = as.factor(NodeId))) +
-  theme_bw() + 
-  geom_point() + 
-  labs(title = "TagID 61780778", x = "Time of day", y = "Beep count") +
-  scale_color_discrete(name = "NodeId") +
-  facet_grid(NodeId ~ .)
-
-actbud_1<-actbud %>%
-  filter(TagId==61780778) %>%
-  filter(freq<"2021-03-27 19:18:000" & freq>"2021-03-26 19:33:00")
-p4 = ggplot(data=actbud_1, aes(x=NodeId, y=beep_count, group=freq, colour=freq)) +
-  geom_point()
-p4
-
-#-----------------------------------------------------------------------------------------
-#getting sunrise and sunset times for Tumbleweed
-day <-
-  getSunlightTimes(
-    date = seq.Date(as.Date("2021-01-20"), as.Date("2021-03-28"), by = 1),
-    keep = c("sunrise", "sunriseEnd", "sunset", "sunsetStart"),
-    lat = 36.490484, 
-    lon = -102.649942,
-    tz = "GMT"
-  )
-
-# Sunrise/set
-day %>%
-  mutate(
-    date = as.POSIXct(date),
-    day_length = as.numeric(sunset - sunrise)
-  ) %>%
-  ggplot(aes(x = date, y = day_length)) +
-  geom_area(fill = "#FDE725FF", alpha = .4) +
-  geom_line(color = "#525252") +
-  scale_x_datetime(
-    expand = c(0, 0),
-    labels = date_format("%b '%y"),
-    breaks =  seq(as.POSIXct(min(day$date)), as.POSIXct(max(day$date)), "month"),
-    minor_breaks = NULL
-  ) +
-  scale_y_continuous(
-    limits = c(0, 24),
-    breaks = seq(0, 24, 2),
-    expand = c(0, 0),
-    minor_breaks = NULL
-  ) +
-  labs(x = "Date", y = "Hours", title = "Tumbleweed - Daytime duration") +
-  theme_bw()
-
-
-#Adding sunrise and sunset
-sunrise.set <- function (lat, long, date, timezone = "GMT", direction = c("sunrise", "sunset"), num.days = 1) 
-  sunrise.set <- function (lat, long, date, timezone = "GMT", direction = c("sunrise", "sunset"))
-    # Why an argument saying how many days? You have the length of your dates
-    #lat.long <- matrix(c(long, lat), nrow = 1)
-    lat.long <- cbind(lon, lat)
-day <- as.POSIXct(freq, tz = timezone)
-# sequence <- seq(from = day, length.out = num.days, by = "days") # Your days object is fine
-sunrise <- sunriset(lat.long, day, direction = "sunrise", POSIXct = TRUE)
-sunset <- sunriset(lat.long, day, direction = "sunset", POSIXct = TRUE)
-# I've replaced sequence with day here
-ss <- data.frame(sunrise, sunset)
-ss <- ss[, -c(1, 3)]
-colnames(ss) <- c("sunrise", "sunset")
-if (direction == "sunrise") {
-  #return(ss[1,1])
-  return(ss[,1])
-} else {
-  #return(ss[1,2])
-  return(ss[,2])
-}       
-
-
-# add sunrise and sunset times to the dataframe
-df.alltags.sub <- sunRiseSet(df.alltags, lat = "recvDeployLat", lon = "recvDeployLon") 
-
-ggplot(data = filter(df.alltags.sub, mfgID == 78557878,
-                     ts > ymd("2020-12-12"),
-                     ts < ymd("2021-02-17"),
-                     recvDeployName == "Tumbleweed"), 
-       aes(x = ts, y = sig)) +
-  theme_bw() + 
-  geom_point() + 
-  labs(x = "Time of year", y = "Signal strength") +
-  geom_vline(aes(xintercept = sunrise), col = "orange") + 
-  geom_vline(aes(xintercept = sunset), col = "blue")
-
-# add sunrise and sunset times to the dataframe
-actbud.sub <- sunRiseSet(resampled, lat = "node_lat_mean", lon = "node_lng_mean") 
-
-ggplot(data = filter(actbud.sub, TagId==61780778,
-                     freq > ("2021-03-26 19:33:00"),
-                     freq < ("2021-03-27 19:18:00")),
-       aes(x = freq, y = beep_count, col = as.factor(NodeId))) +
-  theme_bw() + 
-  geom_point() + 
-  labs(title = "TagID 61780778", x = "Time of day", y = "Beep count") +
-  scale_color_discrete(name = "NodeId") +
-  facet_grid(NodeId ~ .)
-geom_vline(aes(xintercept = sunrise), col = "orange") + 
-  geom_vline(aes(xintercept = sunset), col = "blue")
-
-#-------------------------------------------------------------------------------------------  
 
 #bird 61780778 was pinged at 3287DE the most, which is the closest west node. 32624B (north) and 328A8E(south) are in second
 
@@ -343,7 +567,6 @@ ggplot(data = filter(actbud, TagId == 61780778,
   labs(title = "TagID 61780778", x = "Time of day", y = "Beep count") +
   scale_color_discrete(name = "NodeId") +
   facet_grid(NodeId ~ .) 
-
 
 
 #for one tagged bird
@@ -366,7 +589,7 @@ locations<- weighted_average(freq[1], beep_data, nodes, node_health=NULL, MAX_NO
                              calibrate = NULL, keep_cols = NULL, latlng = TRUE, minRSSI = 0)
 
 #code from script
-#locations <- weighted_average(freq[1], beep_data, nodes, all_data[[2]][[1]], 0, tag_id=tag_id, minRSSI = -105)
+locations <- weighted_average(freq[1], beep_data, nodes, all_data[[2]][[1]], 0, tag_id=tag_id, minRSSI = -105)
 
 
 
@@ -401,6 +624,8 @@ locations <- cbind(locations, locations@coords)
 CCLO_motus<-locations@data
 #change path name where you want .csv to be saved
 write.csv(CCLO_motus,file = "/Users/gamageperera/Desktop/Motus/Motus/data_tools_master/CCLO_motus.csv" )
+library(readr)
+CCLO_motus <- read_csv("data_tools_master/CCLO_motus.csv")
 
 time <- "1 day"
 move <- as.data.table(locations)[, .(Lat = mean(avg_y), Lon = mean(avg_x), std_lat = sd(avg_y), 
