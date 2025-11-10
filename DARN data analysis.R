@@ -1,3 +1,8 @@
+# ##########################################################################
+# # DUSTBOWL AUTOMATED RADIO-TELEMETRY NETWORK (DARN) DATA ANALYSIS - REVISED
+# # Optimized for DARN data focus and departure inference
+# # ##########################################################################
+
 # Load necessary libraries
 # Note: Install them first if needed: install.packages(c("tidyverse", "motus", "DBI", "RSQLite", "lubridate", "geosphere", "suncalc", "sf", "data.table"))
 library(tidyverse)
@@ -5,10 +10,10 @@ library(motus)
 library(DBI)
 library(RSQLite)
 library(lubridate)
-library(geosphere) # For bearing calculations
+library(geosphere) # For bearing and distance calculations
 library(suncalc)   # For twilight calculations
 library(sf)        # For modern spatial data handling (replaces sp/rgdal)
-library(data.table) # For efficient data manipulation if needed (though dplyr handles most here)
+library(data.table)
 
 # Set global environment variables
 Sys.setenv(TZ = "UTC")
@@ -17,10 +22,11 @@ Sys.setenv(TZ = "UTC")
 # DARN Project ID
 proj.num.OU <- 129 # Motus project "University of Oklahoma" (#129)
 
-#### 1. Data Download, Filtering, and Antenna Edits (Revised) ####
+# -------------------------------------------------------------------------
+# 1. Data Download, Filtering, and Antenna Edits
+# -------------------------------------------------------------------------
 
 # Download/load OU project data
-# Use 'new = TRUE' only the first time you download
 OU.motus <- tagme(
   projRecv = proj.num.OU,
   new = FALSE,
@@ -35,10 +41,9 @@ DARN_BOUNDS <- list(
   lon_min = -103.1, lon_max = -102.1
 )
 
-# Extract and immediately filter to DARN tags/detections
-# This is much more efficient than collecting all data first.
-DARN_detections_raw <- tbl(OU.motus, "alltags") %>%
-  # --- Mandatory Filters (from original script) ---
+# Extract and immediately filter to DARN tags/detections (EFFICIENT LOADING)
+full_data <- tbl(OU.motus, "alltags") %>%
+  # --- Mandatory Filters ---
   filter(tagDeployTest == 0) %>% # Restrict to non-test deployments
   filter(recvDeployName != "CTT HQ") %>%
   # --- Filter to DARN RECEIVER area ---
@@ -46,7 +51,7 @@ DARN_detections_raw <- tbl(OU.motus, "alltags") %>%
   filter(between(recvDeployLon, DARN_BOUNDS$lon_min, DARN_BOUNDS$lon_max)) %>%
   # --- Select core columns for analysis ---
   select(
-    speciesID, speciesEN, tagProjID, ts, sig, port, mfgID, motusTagID, runLen,
+    tagID, speciesID, speciesEN, tagProjID, ts, sig, port, mfgID, motusTagID, runLen,
     tagDepLat, tagDepLon, tagDeployID, recvDeployLat, recvDeployLon, recvDeployName,
     antBearing, antHeight, nodeNum
   ) %>%
@@ -57,10 +62,9 @@ DARN_detections_raw <- tbl(OU.motus, "alltags") %>%
   ) %>%
   filter(ts > "2023-10-01") # Apply the date filter from your original script
 
-# Apply Antenna Bearing Edits (Consolidating the edits from lines 415-424)
-DARN_detections <- DARN_detections_raw %>%
+# Apply Antenna Bearing Edits (Consolidating the edits from original script)
+DARN_detections <- full_data %>%
   mutate(
-    # This is your antenna bearing correction list (a single operation)
     antBearing_adj = case_when(
       recvDeployName == "New Playa" ~ antBearing - 15,
       recvDeployName == "Felt" ~ antBearing - 15,
@@ -74,58 +78,42 @@ DARN_detections <- DARN_detections_raw %>%
     )
   )
 
-# Remove the large raw file to free memory
-rm(DARN_detections_raw)
+# -------------------------------------------------------------------------
+# 2. Multi-Tower Detections & Twilight Analysis (Goal 1)
+# -------------------------------------------------------------------------
 
+WINDOW_SIZE_SEC <- 2.5 # Window for near-simultaneous detections
 
-#### 2. Multi-Tower Detections & Twilight Analysis (Goal 1) ####
-
-# Window for near-simultaneous detections (e.g., within 2.5 seconds)
-WINDOW_SIZE_SEC <- 2.5
-
-# Step 1: Group detections into single 'events' (replacing the complex fill/mutate chain)
+# Step 1: Group detections into single 'events'
 DARN_events <- DARN_detections %>%
-  # Sort by tag and time
-  arrange(motusTagID, ts, recvDeployName, port) %>%
-  group_by(motusTagID) %>%
-  # Calculate time difference to the *previous* detection of the same tag
+  arrange(tagID, ts, recvDeployName, port) %>%
+  group_by(tagID) %>%
   mutate(ts_diff = as.numeric(ts) - lag(as.numeric(ts))) %>%
-  # Flag the start of a new, independent event (diff > window or first detection)
   mutate(is_new_event = ifelse(is.na(ts_diff) | ts_diff > WINDOW_SIZE_SEC, 1, 0)) %>%
-  # Create a continuous event ID for all overlapping pings
   mutate(event_id = cumsum(is_new_event)) %>%
   ungroup() %>%
-  # Group by the new event ID to calculate event summaries
   group_by(event_id) %>%
   mutate(
-    w_towers = n_distinct(recvDeployName), # Goal: Count of towers in event
+    w_towers = n_distinct(recvDeployName), # Count of towers in event
     w_antennas = n_distinct(recvDeployName, port) # Count of unique antennas
   ) %>%
   ungroup() %>%
-  select(-ts_diff, -is_new_event) # Clean up temporary columns
+  select(-ts_diff, -is_new_event)
 
-# Step 2: Twilight Analysis (Replacing source("timeToSunriset_edit.R"))
-# Use suncalc to calculate local twilight for the DARN centroid or each tower.
-# We'll use the DARN centroid for simplicity/efficiency in a large join.
-
-# Calculate DARN centroid (for rough twilight approximation)
+# Step 2: Twilight Analysis (Using 'suncalc')
 darn_lat <- mean(DARN_detections$recvDeployLat)
 darn_lon <- mean(DARN_detections$recvDeployLon)
 
-# Get twilight times for all dates in the dataset
 twilight_data <- DARN_events %>%
   mutate(date = as_date(ts)) %>%
   distinct(date) %>%
   rowwise() %>%
   mutate(
-    # Calculate twilight for the DARN centroid
     twilight_times = list(
       getSunlightTimes(
-        date = date,
-        lat = darn_lat,
-        lon = darn_lon,
+        date = date, lat = darn_lat, lon = darn_lon,
         keep = c("nauticalDawn", "sunrise", "sunset", "nauticalDusk"),
-        tz = "UTC" # Ensure times are in UTC to match detection 'ts'
+        tz = "UTC"
       )
     )
   ) %>%
@@ -145,11 +133,10 @@ DARN_events_twilight <- DARN_events %>%
     )
   )
 
-# --- Goal 1 Output: Evaluate multi-tower detections relative to twilight ---
-# Focus on unique events (not every ping)
+# Goal 1 Output: Evaluate multi-tower detections relative to twilight
 DARN_twilight_summary <- DARN_events_twilight %>%
   group_by(event_id) %>%
-  slice(1) %>% # Select one row per unique event
+  slice(1) %>%
   ungroup() %>%
   group_by(time_of_day, w_towers) %>%
   summarise(
@@ -160,116 +147,31 @@ DARN_twilight_summary <- DARN_events_twilight %>%
 print("--- Goal 1 Summary (Events by Twilight and Tower Count) ---")
 print(DARN_twilight_summary)
 
+# -------------------------------------------------------------------------
+# 3. Triangulation Approximation (Weighted Centroid) (Goal 3)
+# -------------------------------------------------------------------------
 
-#### 3. Departure Movement & Weather Analysis (Goal 2) ####
-
-# Step 1: Identify Last DARN Detection for each tag
-Last_DARN_Detections <- DARN_detections %>%
-  group_by(motusTagID) %>%
-  filter(ts == max(ts)) %>% # Find the single last detection for each tag
-  # Handle ties (in case of simultaneous detections at max(ts)) by picking one
-  slice(1) %>%
-  ungroup()
-
-# Step 2: Link to Distant Detections (to find departure bearing)
-# The user's code for 'Out of area detections' (DARN.distDets) is needed here.
-DARN_distDets <- tbl(OU.motus, "alltags") %>%
-  # Filter to tags deployed within DARN (based on deployment metadata)
-  filter(between(tagDepLat, DARN_BOUNDS$lat_min, DARN_BOUNDS$lat_max)) %>%
-  filter(between(tagDepLon, DARN_BOUNDS$lon_min, DARN_BOUNDS$lon_max)) %>%
-  # Exclude detections *within* DARN's operational receiver area
-  filter(!between(recvDeployLat, DARN_BOUNDS$lat_min, DARN_BOUNDS$lat_max) |
-           !between(recvDeployLon, DARN_BOUNDS$lon_min, DARN_BOUNDS$lon_max)) %>%
-  filter(tagDeployTest == 0) %>%
-  # Select key movement data and collect
-  select(motusTagID, ts, recvDeployLat, recvDeployLon, recvDeployName, tagDepLat, tagDepLon) %>%
-  collect() %>%
-  mutate(ts = as_datetime(ts, tz = "UTC", origin = "1970-01-01"))
-
-# Find the *first* distant detection after leaving DARN
-First_Distant_Detections <- Last_DARN_Detections %>%
-  # Join last DARN detection with all distant detections for that tag
-  left_join(DARN_distDets, by = "motusTagID", suffix = c(".last_darn", ".first_distant")) %>%
-  # Keep only distant detections *after* the last DARN detection
-  filter(ts.first_distant > ts.last_darn) %>%
-  # Find the earliest of those distant detections
-  group_by(motusTagID) %>%
-  filter(ts.first_distant == min(ts.first_distant)) %>%
-  slice(1) %>% # Handle ties
-  ungroup()
-
-# Step 3: Calculate Departure Bearing
-Departure_Analysis <- First_Distant_Detections %>%
-  rowwise() %>%
-  mutate(
-    # Calculate great circle bearing from last DARN tower to first distant tower
-    departure_bearing = bearing(
-      p1 = c(recvDeployLon.last_darn, recvDeployLat.last_darn),
-      p2 = c(recvDeployLon.first_distant, recvDeployLat.first_distant)
-    )
-  ) %>%
-  ungroup() %>%
-  select(
-    motusTagID, ts.last_darn, recvDeployName.last_darn,
-    ts.first_distant, recvDeployName.first_distant,
-    departure_bearing
-  )
-
-# Step 4: Weather Integration (Conceptual)
-# *Note: Mesonet data is external and not provided. This is the integration step.*
-# You would need to load your Mesonet data (e.g., from a CSV) and join it.
-
-# Conceptual Mesonet Data Frame (You replace this with your loaded data)
-# Mesonet_data <- read_csv("your_mesonet_data.csv") %>%
-#   mutate(ts = as_datetime(ts, tz = "UTC")) # Ensure UTC timestamps
-
-# Departure_Analysis_with_Weather <- Departure_Analysis %>%
-#   left_join(Mesonet_data, by = c("ts.last_darn" = "ts")) # Simple time match
-# # A more complex spatial/temporal nearest-neighbor match (using Mesonet station lat/lon)
-# # may be required here for best results.
-
-
-print("--- Goal 2 Output: Example Departure Bearing ---")
-print(head(Departure_Analysis, 5))
-
-
-# --- 4. Triangulation and Landcover Linkage (Goal 3 - Spatial Prep) ---
-
-# Step 2: Select Multi-Tower Events for Centroid Calculation
-# We reuse the DARN_events data frame created in Goal 1
+# Step 1: Filter to multi-tower events
 Triangulation_Events <- DARN_events %>%
   filter(w_towers >= 2) %>%
-  
-  # --- Centroid Calculation Logic ---
+
+  # Step 2: Calculate Weights and Centroids
   group_by(event_id) %>%
-  
-  # 1. Transform Signal Strength to a Weight
-  # Max(sig) is the least negative/strongest signal.
-  # We shift and scale the sig values so that the strongest signal in the event
-  # has a high positive value (near zero or above) and the weakest has a low one.
   mutate(
-    # Get the max signal in the event (strongest signal = closer tower)
+    # 1. Transform Signal Strength to a Weight
     max_sig = max(sig, na.rm = TRUE),
-    # Scale signal relative to the max signal in the event.
-    # We use '10^(sig / 10)' which relates dBm back to power magnitude (mW),
-    # then scale by the max power to get a weight from 0 to 1.
-    # Alternatively, a simpler linear shift can be used:
-    # weight = (sig - min(sig, na.rm=T)) + 1 # Simple linear weight
-    
-    # Use the max-scaled linear weight for robustness:
-    weight = max_sig - sig + 1 # Strength difference: Stronger signal (sig closer to max_sig) gets a higher weight.
+    # Stronger signal (sig closer to max_sig) gets a higher weight.
+    weight = max_sig - sig + 1
   ) %>%
-  
-  # 2. Calculate Simple Centroid (for comparison)
   summarise(
+    # Calculate Simple Centroid
     simple_lat = mean(recvDeployLat),
     simple_lon = mean(recvDeployLon),
-    
-    # 3. Calculate WEIGHTED Centroid
-    # Use the standard weighted mean function for Latitude and Longitude
+
+    # Calculate WEIGHTED Centroid
     weighted_lat = weighted.mean(recvDeployLat, w = weight),
     weighted_lon = weighted.mean(recvDeployLon, w = weight),
-    
+
     ts = first(ts), # Keep time of first detection
     w_towers = first(w_towers),
     n_pings = n(),
@@ -281,36 +183,104 @@ Weighted_Centroid_sf <- Triangulation_Events %>%
   st_as_sf(coords = c("weighted_lon", "weighted_lat"), crs = 4326) %>%
   st_transform(crs = 32613) # UTM Zone 13N (for accurate spatial joins)
 
-# --- Comparison of Centroids ---
-# To see the difference between the simple and weighted locations
-comparison_output <- Triangulation_Events %>%
-  select(event_id, simple_lat, weighted_lat, simple_lon, weighted_lon) %>%
+print("--- Goal 3: Weighted Centroid Dataframe Head ---")
+print(head(Triangulation_Events, 5))
+
+# -------------------------------------------------------------------------
+# 4. Inferring Departure Location and Direction (Restructured Goal 2)
+# -------------------------------------------------------------------------
+
+# Step 1: Define the Last Significant Event (LSE) for Each Tag
+
+# Get time of last multi-tower event for each tag
+Last_Centroid_Time <- Triangulation_Events %>%
+  group_by(tagID) %>%
+  summarise(
+    last_centroid_ts = max(ts),
+    .groups = "drop"
+  )
+
+# Join the last centroid location back to the tag list
+Departure_Inferences <- Last_Centroid_Time %>%
+  left_join(Triangulation_Events, by = c("tagID", "last_centroid_ts" = "ts")) %>%
+  select(tagID, last_centroid_ts, weighted_lat, weighted_lon, w_towers, n_pings) %>%
+  rename(Last_Centroid_Lat = weighted_lat, Last_Centroid_Lon = weighted_lon)
+
+# -------------------------------------------------------------------------
+# Step 2: Analyze Final Pings for Directionality (The Departure Signature)
+# -------------------------------------------------------------------------
+
+# Find time of the absolute last ping (even if single) for context
+Last_Ping_Time <- full_data %>%
+  group_by(tagID) %>%
+  summarise(
+    last_ping_ts = max(ts),
+    .groups = "drop"
+  )
+
+Departure_Inferences <- Departure_Inferences %>%
+  left_join(Last_Ping_Time, by = "tagID")
+
+# Define a window for final directional pings after the Last Centroid Event
+DEPARTURE_WINDOW_MINUTES <- 30
+
+# Identify the absolute final ping that occurred after the LSE
+Final_Pings_Info <- full_data %>%
+  left_join(Departure_Inferences, by = "tagID") %>%
+  # Filter only to the window after the LSE
+  filter(ts > last_centroid_ts &
+         ts <= (last_centroid_ts + minutes(DEPARTURE_WINDOW_MINUTES))) %>%
+  
+  # For each tag, identify the very final detection in that window
+  group_by(tagID) %>%
+  filter(ts == max(ts)) %>%
+  slice(1) %>% # Handle ties
+  select(tagID, Final_Ping_TS = ts, Final_RecvName = recvDeployName, Final_Port = port, Final_Sig = sig, Final_AntBearing = antBearing_adj) %>%
+  ungroup()
+
+# Add the Final Ping information
+Departure_Inferences <- Departure_Inferences %>%
+  left_join(Final_Pings_Info, by = "tagID")
+
+# -------------------------------------------------------------------------
+# Step 3: Infer Direction based on Final Antenna Bearing (Leveraging Yagi Data)
+# -------------------------------------------------------------------------
+
+# MOCK LOOKUP TABLE - ***REPLACE THIS WITH YOUR ACTUAL ANTENNA DATA***
+# This step is crucial for linking the antenna bearing to an inferred direction.
+# You need a table that defines the relationship between the final antenna's bearing 
+# (Final_AntBearing) and the corresponding wind/movement direction.
+
+# Example: If Final_AntBearing is 90 degrees (East), the inferred departure direction is East.
+Departure_Inferences <- Departure_Inferences %>%
   mutate(
-    # Calculate the distance in meters between the two centroid types
-    distance_m = distHaversine(
-      p1 = cbind(simple_lon, simple_lat),
-      p2 = cbind(weighted_lon, weighted_lat)
+    Inferred_Direction_Deg = Final_AntBearing, # Assuming the final antenna's bearing is the best inference
+    # Classify bearing into cardinal directions for behavioral ecology:
+    Inferred_Direction_Cardinal = case_when(
+      between(Inferred_Direction_Deg, 337.5, 22.5) ~ "North",
+      between(Inferred_Direction_Deg, 22.5, 67.5) ~ "Northeast",
+      between(Inferred_Direction_Deg, 67.5, 112.5) ~ "East",
+      between(Inferred_Direction_Deg, 112.5, 157.5) ~ "Southeast",
+      between(Inferred_Direction_Deg, 157.5, 202.5) ~ "South",
+      between(Inferred_Direction_Deg, 202.5, 247.5) ~ "Southwest",
+      between(Inferred_Direction_Deg, 247.5, 292.5) ~ "West",
+      between(Inferred_Direction_Deg, 292.5, 337.5) ~ "Northwest",
+      TRUE ~ "Unknown/Omni"
     )
   )
 
-print("--- Weighted Centroid Output (Comparison) ---")
-print(head(comparison_output, 5))
+# Final clean table for Departure
+Departure_Summary <- Departure_Inferences %>%
+  select(
+    tagID,
+    Last_Centroid_TS,
+    Last_Centroid_Lat,
+    Last_Centroid_Lon,
+    Final_Ping_TS,
+    Final_RecvName,
+    Final_Antenna_Bearing = Inferred_Direction_Deg,
+    Inferred_Direction_Cardinal
+  )
 
-
-# Step 4: Landcover Linkage (Conceptual - using the Weighted Centroid)
-# This step remains the same, but uses the improved sf object
-
-# Load Landcover/Playa data (Assuming you have shapefiles)
-# Federal_Grasslands_sf <- st_read("Federal_Grasslands.shp") %>% st_transform(32613)
-# Playa_Lakes_sf <- st_read("Playa_Lakes.shp") %>% st_transform(32613)
-
-# Spatial Join (Intersection)
-# Centroid_Landcover_Joined <- Weighted_Centroid_sf %>%
-#   st_join(Federal_Grasslands_sf, join = st_intersects) %>%
-#   st_join(Playa_Lakes_sf, join = st_intersects)
-
-print("--- Goal 3 Output: Spatial Data Objects Created ---")
-print("DARN_ants_sf (Antenna locations in UTM):")
-print(DARN_ants_sf)
-print("Centroid_sf (Approximate Bird Locations):")
-print(Centroid_sf)
+print("--- Goal 4: Departure Summary (Last Known Position & Direction) ---")
+print(head(Departure_Summary))
