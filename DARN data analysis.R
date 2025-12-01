@@ -183,6 +183,18 @@ Weighted_Centroid_sf <- Triangulation_Events %>%
   st_as_sf(coords = c("weighted_lon", "weighted_lat"), crs = 4326) %>%
   st_transform(crs = 32613) # UTM Zone 13N (for accurate spatial joins)
 
+
+ggplot(Weighted_Centroid_sf) + 
+  geom_sf(data = Weighted_Centroid_sf, color = "black") ##Plot of the weighted centroid of the triangulation events
+
+library(png)
+img <- readPNG("DARN.png")
+library(ggplot2)
+ggplot(Weighted_Centroid_sf) +
+  (annotation_raster(img, xmin = -Inf, xmax = Inf, ymin = -Inf, ymax = Inf)) +
+  geom_sf(data = Weighted_Centroid_sf, color = "darkolivegreen2")
+
+
 print("--- Goal 3: Weighted Centroid Dataframe Head ---")
 print(head(Triangulation_Events, 5))
 
@@ -219,17 +231,17 @@ Last_Ping_Time <- full_data %>%
   )
 
 Departure_Inferences <- Departure_Inferences %>%
-  left_join(Last_Ping_Time, by = "motusTagID") ##PROBLEM -- I can't figure this out. The left_join isn't working as intended.  
+  left_join(Last_Ping_Time, by =c ("last_centroid_ts" = "last_ping_ts")) #I'm not sure if this is comparable, but it makes the code work  
 
 # Define a window for final directional pings after the Last Centroid Event
 DEPARTURE_WINDOW_MINUTES <- 30
 
 # Identify the absolute final ping that occurred after the LSE
 Final_Pings_Info <- full_data %>%
-  left_join(Departure_Inferences, by = "motusTagID") %>%
+  left_join(Departure_Inferences, by = c("ts" = "last_centroid_ts")) %>%
   # Filter only to the window after the LSE
   filter(ts > last_centroid_ts &
-         ts <= (last_centroid_ts + minutes(DEPARTURE_WINDOW_MINUTES))) %>%
+         ts <= (last_centroid_ts + minutes(DEPARTURE_WINDOW_MINUTES))) %>% #problem here
   
   # For each tag, identify the very final detection in that window
   group_by(motusTagID) %>%
