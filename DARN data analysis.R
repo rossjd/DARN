@@ -31,7 +31,7 @@ OU.motus <- tagme(
   projRecv = proj.num.OU,
   new = FALSE,
   forceMeta = TRUE,
-  update = TRUE, # Set to FALSE if you are only loading from a local file
+  update = FALSE, # Set to FALSE if you are only loading from a local file
   dir = "/Users/kimber/Longspurs" #Alter as needed for individual computers 
 )
 
@@ -59,8 +59,8 @@ full_data <- tbl(OU.motus, "alltags") %>%
   # --- Final cleanup & preparation ---
   mutate(
     ts = as_datetime(ts, tz = "UTC", origin = "1970-01-01") # Ensure correct POSIXct format
-  ) %>%
-  filter(ts > "2023-10-01") # Apply the date filter from your original script
+  ) #%>%
+  #filter(ts > "2023-10-01") # messing with this
 
 # Apply Antenna Bearing Edits (Consolidating the edits from original script)
 DARN_detections <- full_data %>%
@@ -83,22 +83,31 @@ DARN_detections <- full_data %>%
 # -------------------------------------------------------------------------
 
 WINDOW_SIZE_SEC <- 2.5 # Window for near-simultaneous detections
+VISIT_SIZE_DAYS <- 432000 #this is the number of seconds in 5 days
 
 # Step 1: Group detections into single 'events'
-DARN_events <- DARN_detections %>%
+DARN_events <- DARN_detections %>% #something wrong here with event_id
   arrange(motusTagID, ts, recvDeployName, port) %>%
   group_by(motusTagID) %>%
   mutate(ts_diff = as.numeric(ts) - lag(as.numeric(ts))) %>%
   mutate(is_new_event = ifelse(is.na(ts_diff) | ts_diff > WINDOW_SIZE_SEC, 1, 0)) %>%
-  mutate(event_id = cumsum(is_new_event)) %>%
+  #days between visits -- are they over 5 days, if yes, then it's a new visit. 
+  mutate(visit_gap_bigger_5 = ifelse(is.na(ts_diff) | ts_diff > VISIT_SIZE_DAYS, 1, 0)) %>% 
+  mutate(visit_id = cumsum(visit_gap_bigger_5)) %>%
+  mutate(bird_event_seq = cumsum(is_new_event)) %>%
   ungroup() %>%
+  mutate(event_id = paste(motusTagID, bird_event_seq, sep = "_")) %>%
+  mutate(visit_id_b = paste(motusTagID, visit_id, sep = "_")) %>% #new, visit_id_b because it's the visit id with the bird id 
   group_by(event_id) %>%
   mutate(
-    w_towers = n_distinct(recvDeployName), # Count of towers in event
-    w_antennas = n_distinct(recvDeployName, port) # Count of unique antennas
+    w_towers = n_distinct(recvDeployName), 
+    w_antennas = n_distinct(recvDeployName, port),
+    # Ensure we keep the numeric sequence available for later filtering
+    bird_event_seq = first(bird_event_seq),
+    motusTagID = first(motusTagID)
   ) %>%
   ungroup() %>%
-  select(-ts_diff, -is_new_event)
+  select(-ts_diff, -is_new_event, -visit_gap_bigger_5)
 
 # Step 2: Twilight Analysis (Using 'suncalc')
 darn_lat <- mean(DARN_detections$recvDeployLat)
@@ -152,7 +161,7 @@ print(DARN_twilight_summary)
 # -------------------------------------------------------------------------
 
 # Step 1: Filter to multi-tower events
-Triangulation_Events <- DARN_events %>%
+Triangulation_Events <- DARN_events %>% #here is the start of the problem where motus tag ID is lost
   filter(w_towers >= 2) %>%
 
   # Step 2: Calculate Weights and Centroids
@@ -187,12 +196,12 @@ Weighted_Centroid_sf <- Triangulation_Events %>%
 ggplot(Weighted_Centroid_sf) + 
   geom_sf(data = Weighted_Centroid_sf, color = "black") ##Plot of the weighted centroid of the triangulation events
 
-library(png)
-img <- readPNG("DARN.png")
-library(ggplot2)
-ggplot(Weighted_Centroid_sf) +
-  (annotation_raster(img, xmin = -Inf, xmax = Inf, ymin = -Inf, ymax = Inf)) +
-  geom_sf(data = Weighted_Centroid_sf, color = "darkolivegreen2")
+#library(png)
+#img <- readPNG("DARN.png")
+#library(ggplot2)
+#ggplot(Weighted_Centroid_sf) +
+  #(annotation_raster(img, xmin = -Inf, xmax = Inf, ymin = -Inf, ymax = Inf)) +
+  #geom_sf(data = Weighted_Centroid_sf, color = "darkolivegreen2")
 
 
 print("--- Goal 3: Weighted Centroid Dataframe Head ---")
@@ -205,7 +214,7 @@ print(head(Triangulation_Events, 5))
 # Step 1: Define the Last Significant Event (LSE) for Each Tag
 
 # Get time of last multi-tower event for each tag
-Last_Centroid_Time <- Triangulation_Events %>%
+Last_Centroid_Time <- Triangulation_Events %>% #issue here now? 
   group_by(event_id) %>%
   summarise(
     last_centroid_ts = max(ts),
@@ -225,48 +234,74 @@ Departure_Inferences <- Last_Centroid_Time %>%
 # Find time of the absolute last ping (even if single) for context
 Last_Ping_Time <- full_data %>% 
   group_by(motusTagID) %>% 
-  summarise(
-    last_ping_ts = max(ts),
+  summarize(
+  last_ping_ts = max(ts),
     .groups = "drop"
-  )
+  ) 
 
-Departure_Inferences <- Departure_Inferences %>%
-  left_join(Last_Ping_Time, by =c ("last_centroid_ts" = "last_ping_ts")) #I'm not sure if this is comparable, but it makes the code work  
+Departure_Inferences <- Departure_Inferences %>% ##now here's the issue
+  left_join(Last_Ping_Time, by =c ("last_centroid_ts" = "last_ping_ts")) 
 
 # Define a window for final directional pings after the Last Centroid Event
 DEPARTURE_WINDOW_MINUTES <- 30
 
 # Identify the absolute final ping that occurred after the LSE
-Final_Pings_Info <- full_data %>%
-  left_join(Departure_Inferences, by = c("ts" = "last_centroid_ts")) %>%
+#Final_Pings_Info <- full_data %>%
+  #left_join(Departure_Inferences, by = c("" = "")) #timestamp has duplicates, motus tag has many NAs in departure_inferences. If event_id is added to the full data we could combine off that if we figure out how to avoid duplicates 
   # Filter only to the window after the LSE
-  filter(ts > last_centroid_ts &
-         ts <= (last_centroid_ts + minutes(DEPARTURE_WINDOW_MINUTES))) %>% #problem here
+  #filter(ts > last_centroid_ts &
+         #ts <= (last_centroid_ts + minutes(DEPARTURE_WINDOW_MINUTES))) %>% 
   
   # For each tag, identify the very final detection in that window
+  #group_by(motusTagID) %>%
+  #filter(ts == max(ts)) %>%
+  #slice(1) %>% # Handle ties
+  #select(motusTagID, Final_Ping_TS = ts, Final_RecvName = recvDeployName, Final_Port = port, Final_Sig = sig, Final_AntBearing = antBearing_adj) %>%
+  #ungroup()
+
+# Add the Final Ping information
+#Departure_Inferences <- Departure_Inferences %>%
+  #left_join(Final_Pings_Info, by = "motusTagID")
+
+# -------------------------------------------------------------------------
+# Identify the Last 5 Distinct Events for Each Bird
+# -------------------------------------------------------------------------
+
+Final_5_Events <- DARN_events %>%
+  # 1. Collapse to one row per event first (so we don't get 5 pings from the same second)
+  group_by(event_id) %>%
+  summarise(
+    motusTagID = first(motusTagID),
+    bird_event_seq = first(bird_event_seq), # This is our reliable numeric sorter
+    ts = first(ts),
+    lat = mean(recvDeployLat),
+    lon = mean(recvDeployLon),
+    w_towers = first(w_towers),
+    towers_involved = paste(unique(recvDeployName), collapse = ", "),
+    .groups = "drop"
+  ) %>%
+  
+  # 2. Group by Bird and select the 5 highest numeric sequence IDs
   group_by(motusTagID) %>%
-  filter(ts == max(ts)) %>%
-  slice(1) %>% # Handle ties
-  select(motusTagID, Final_Ping_TS = ts, Final_RecvName = recvDeployName, Final_Port = port, Final_Sig = sig, Final_AntBearing = antBearing_adj) %>%
+  slice_max(order_by = bird_event_seq, n = 5) %>% # 1000 is correctly > 999 here
+  arrange(motusTagID, desc(bird_event_seq)) %>%
   ungroup()
+
+print("--- Last 5 Events Per Bird (Verified by Sequence) ---")
+print(head(Final_5_Events, 10))
 
 # Add the Final Ping information
 Departure_Inferences <- Departure_Inferences %>%
-  left_join(Final_Pings_Info, by = "motusTagID")
+  left_join(Final_Pings_Info, by = "motusTagID") #We have not figured out Final_Pings_Info
 
 # -------------------------------------------------------------------------
 # Step 3: Infer Direction based on Final Antenna Bearing (Leveraging Yagi Data)
 # -------------------------------------------------------------------------
+#There is actually a block around line 65 that has the antenna bearings already put in
 
-# MOCK LOOKUP TABLE - ***REPLACE THIS WITH YOUR ACTUAL ANTENNA DATA***
-# This step is crucial for linking the antenna bearing to an inferred direction.
-# You need a table that defines the relationship between the final antenna's bearing 
-# (Final_AntBearing) and the corresponding wind/movement direction.
-
-# Example: If Final_AntBearing is 90 degrees (East), the inferred departure direction is East.
 Departure_Inferences <- Departure_Inferences %>%
   mutate(
-    Inferred_Direction_Deg = Final_AntBearing, # Assuming the final antenna's bearing is the best inference
+    Inferred_Direction_Deg = Final_AntBearing, # Assuming the final antenna's bearing is the best inference. #Final_AntBearing not found
     # Classify bearing into cardinal directions for behavioral ecology:
     Inferred_Direction_Cardinal = case_when(
       between(Inferred_Direction_Deg, 337.5, 22.5) ~ "North",
