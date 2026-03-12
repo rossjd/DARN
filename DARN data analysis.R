@@ -266,33 +266,29 @@ DEPARTURE_WINDOW_MINUTES <- 30
 # -------------------------------------------------------------------------
 # Identify the Last 5 Distinct Events for Each Bird
 # -------------------------------------------------------------------------
+Bookends <- DARN_events %>%
+  group_by(visit_id_b) %>%
+  #slice(1, n()) #this is only the first and the last of each visit_id_b. I can't figure out how to make this 5 without getting "subscript out of bounds" error
+  slice(1:2, (n() - 1):n()) %>% #this is either first and last 2, or first one last 3, or first 3 last 1. I think it's first and last 2
+  select(speciesID, speciesEN, ts, recvDeployLat, recvDeployLon, w_towers, w_antennas, antBearing, antHeight, event_id, visit_id_b, bird_event_seq)
 
-Final_5_Events <- DARN_events %>%
-  # 1. Collapse to one row per event first (so we don't get 5 pings from the same second)
-  group_by(event_id) %>%
-  summarise(
-    motusTagID = first(motusTagID),
-    bird_event_seq = first(bird_event_seq), # This is our reliable numeric sorter
-    ts = first(ts),
-    lat = mean(recvDeployLat),
-    lon = mean(recvDeployLon),
-    w_towers = first(w_towers),
-    towers_involved = paste(unique(recvDeployName), collapse = ", "),
-    .groups = "drop"
-  ) %>%
-  
-  # 2. Group by Bird and select the 5 highest numeric sequence IDs
-  group_by(motusTagID) %>%
-  slice_max(order_by = bird_event_seq, n = 5) %>% # 1000 is correctly > 999 here
-  arrange(motusTagID, desc(bird_event_seq)) %>%
-  ungroup()
+install.packages("movetrack",
+                 repos = c("https://g-rppl.r-universe.dev", getOption("repos"))
+)
+library(cmdstanr)
+check_cmdstan_toolchain(fix = TRUE)
+install_cmdstan(cores = 2)
 
-print("--- Last 5 Events Per Bird (Verified by Sequence) ---")
-print(head(Final_5_Events, 10))
+test_movetrack <- DARN_events %>%
+  select(tagDeployID, sig, ts, recvDeployLat, recvDeployLon, w_towers, w_antennas, antBearing, antHeight, event_id, visit_id_b, bird_event_seq) %>% #neither tagDepLon/tagDepLat nor recvDeployLat/recvDeployLon have any different values
+  mutate(aType = "monopole") %>%
+  filter(ts > "2021-01-25 19:27:39") %>% #trying to get only the last day of 44595_2 
+  filter(visit_id_b == "44595_2")
 
-# Add the Final Ping information
-Departure_Inferences <- Departure_Inferences %>%
-  left_join(Final_Pings_Info, by = "motusTagID") #We have not figured out Final_Pings_Info
+#movetrack::track(test_movetrack) #missing 'aType' column, despite me adding a column called aType
+model.test <- movetrack::track(test_movetrack, aType = "aType", dTime = 0.1)  
+
+movetrack::mapTrack(model.test) #lat and lon same number across each detection so not showing anything. We may need to do the triangulation?
 
 # -------------------------------------------------------------------------
 # Step 3: Infer Direction based on Final Antenna Bearing (Leveraging Yagi Data)
