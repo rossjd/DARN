@@ -14,6 +14,7 @@ library(geosphere) # For bearing and distance calculations
 library(suncalc)   # For twilight calculations
 library(sf)        # For modern spatial data handling (replaces sp/rgdal)
 library(data.table)
+library(glue)
 
 # Set global environment variables
 Sys.setenv(TZ = "UTC")
@@ -41,30 +42,16 @@ DARN_BOUNDS <- list(
   lon_min = -103.1, lon_max = -102.1
 )
 
-# Step 1: Re-extract Tag Metadata from your Motus project object
-# We assume 'pro' is your Motus project object (e.g., from tagme)
-Tag_Metadata <- OU.motus$alltags %>%
-  select(motusTagID, mfgID, model, manufacturer) %>%
-  mutate(
-    tag_type = case_when(
-      grepl("LifeTag", model, ignore.case = TRUE) ~ "LifeTag (Solar)",
-      grepl("Hybrid", model, ignore.case = TRUE) ~ "Hybrid (Batt/Solar)",
-      TRUE ~ "Other/Unknown"
-    )
-  )
-
-# Step 2: Push this into your Raw_Analysis_Final
-Raw_Analysis_Final <- Raw_Analysis_Final %>%
-  left_join(Tag_Metadata, by = "motusTagID")
-
-cat("\n--- Tag Type Distribution Audit ---\n")
-print(table(Raw_Analysis_Final$tag_type, Raw_Analysis_Final$outcome))
 
 # Extract and immediately filter to DARN tags/detections (EFFICIENT LOADING)
 full_data <- tbl(OU.motus, "alltags") %>%
   # --- Mandatory Filters ---
-  filter(tagDeployTest == 0) %>% # Restrict to non-test deployments
+  filter(tagDeployTest == 0) %>% 
   filter(recvDeployName != "CTT HQ") %>%
+  
+  # FIX: The "Ghostbuster" Filter (Eliminate isolated radio noise)
+  filter(runLen >= 3) %>% 
+  
   # --- Filter to DARN RECEIVER area ---
   filter(between(recvDeployLat, DARN_BOUNDS$lat_min, DARN_BOUNDS$lat_max)) %>%
   filter(between(recvDeployLon, DARN_BOUNDS$lon_min, DARN_BOUNDS$lon_max)) %>%
@@ -72,14 +59,22 @@ full_data <- tbl(OU.motus, "alltags") %>%
   select(
     speciesID, speciesEN, tagProjID, ts, sig, port, mfgID, motusTagID, runLen,
     tagDepLat, tagDepLon, tagDeployID, recvDeployLat, recvDeployLon, recvDeployName,
-    antBearing, antHeight, nodeNum, tagModel
+    antBearing, antHeight, nodeNum, tagModel, 
+    tagDeployStart # <--- NEW: Pull the deployment timestamp
   ) %>%
-  collect() %>% # Bring data from SQL table into an R data frame
+  collect() %>% 
   # --- Final cleanup & preparation ---
   mutate(
-    ts = as_datetime(ts, tz = "UTC", origin = "1970-01-01") # Ensure correct POSIXct format
-  ) #%>%
-  #filter(ts > "2023-10-01") # messing with this
+    # Convert both fields to POSIXct
+    ts = as_datetime(ts, tz = "UTC", origin = "1970-01-01"),
+    tagDeployStart = as_datetime(tagDeployStart, tz = "UTC", origin = "1970-01-01")
+  ) %>%
+  # FIX: 6-Month Biological Lifespan Filter
+  # Ensure the ping happened AFTER deployment, and NO LATER than 6 months post-deployment
+  filter(ts >= tagDeployStart & ts <= (tagDeployStart + months(6)))
+
+cat(glue("\n--- EXTRACTION COMPLETE ---\n"))
+cat(glue("Retained {nrow(full_data)} valid detections within 6 months of deployment.\n\n"))
 
 
 # Apply Antenna Bearing Edits (Consolidating the edits from original script)
@@ -144,21 +139,25 @@ DARN_events <- DARN_detections %>%
   ungroup() %>%
   select(-ts_diff, -is_new_event, -visit_gap_bigger_5)
 
-# Step 2: Twilight Analysis (Using 'suncalc')
+# Step 2: Twilight Analysis (Corrected for Local Time Crossover)
 darn_lat <- mean(DARN_detections$recvDeployLat)
 darn_lon <- mean(DARN_detections$recvDeployLon)
 
 twilight_data <- DARN_events %>%
-  mutate(Date = as_date(ts)) %>%
-  distinct(Date) %>%
+  # FIX: Convert to local time before extracting the date
+  mutate(
+    ts_local = with_tz(ts, tzone = "America/Chicago"),
+    date_local = as_date(ts_local)
+  ) %>%
+  distinct(date_local) %>%
   rowwise() %>%
   mutate(
     twilight_times = list(
       getSunlightTimes(
-        date = Date, lat = darn_lat, lon = darn_lon,
+        date = date_local, lat = darn_lat, lon = darn_lon,
         keep = c("nauticalDawn", "sunrise", "sunset", "nauticalDusk"),
-        tz = "UTC"
-      )
+        tz = "America/Chicago" # FIX: Request twilight in local time
+      ) %>% select(-date) # Prevent unnesting conflict
     )
   ) %>%
   unnest(twilight_times) %>% 
@@ -166,14 +165,20 @@ twilight_data <- DARN_events %>%
 
 # Join twilight data and assign time-of-day category
 DARN_events_twilight <- DARN_events %>%
-  filter(Local_Dep == TRUE) %>% # FIX: Restrict analysis to locally-tagged wintering birds
-  mutate(date = as_date(ts)) %>%
-  left_join(twilight_data, by = "date") %>%
+  filter(Local_Dep == TRUE) %>% # Restrict analysis to locally-tagged wintering birds
+  # FIX: Convert ping to local time and extract local date to match twilight_data
   mutate(
+    ts_local = with_tz(ts, tzone = "America/Chicago"),
+    date_local = as_date(ts_local)
+  ) %>%
+  # FIX: Join using the matching local date column
+  left_join(twilight_data, by = "date_local") %>%
+  mutate(
+    # FIX: Compare the local timestamp to the local twilight bounds
     time_of_day = case_when(
-      ts <= nauticalDawn | ts >= nauticalDusk ~ "Night",
-      ts > nauticalDawn & ts < sunrise ~ "Pre-Sunrise Twilight (Nautical/Civil)",
-      ts > sunset & ts < nauticalDusk ~ "Post-Sunset Twilight (Civil/Nautical)",
+      ts_local <= nauticalDawn | ts_local >= nauticalDusk ~ "Night",
+      ts_local > nauticalDawn & ts_local < sunrise ~ "Pre-Sunrise Twilight (Nautical/Civil)",
+      ts_local > sunset & ts_local < nauticalDusk ~ "Post-Sunset Twilight (Civil/Nautical)",
       TRUE ~ "Day"
     )
   )
@@ -277,11 +282,10 @@ Arrivals_Data <- DARN_events %>%
 # Step 3: Combine into a clean dataframe ready for 'movetrack'
 Movetrack_Prep <- bind_rows(Departures_Data, Arrivals_Data) %>%
   arrange(motusTagID, ts) %>%
-  # Select the crucial columns, keeping tower and antenna data fully intact per row
   select(
     motusTagID, visit_id, visit_seq, movement_type, event_id, bird_event_seq, ts, 
     recvDeployName, recvDeployLat, recvDeployLon, antBearing_adj, sig, port, w_towers,
-    Local_Dep # NEW: Keep the deployment flag so it passes to the plotting sections
+    Local_Dep, tagModel # ADDED HERE
   )
 
 print("--- Data Extracted for movetrack (First 15 Rows) ---")
@@ -325,7 +329,12 @@ Movetrack_Prep <- Movetrack_Prep %>%
 # Note: This plots the raw empirical tower detections. Once you run movetrack's HMM, 
 # you can swap 'recvDeployLat'/'recvDeployLon' for the modeled coordinates.
 
-# 3A: Map for Local Wintering Birds
+Movetrack_Prep <- Movetrack_Prep %>%
+  mutate(cohort = if_else(Local_Dep == TRUE, 
+                          "Local Wintering (DARN Tagged)", 
+                          "Passage Migrant (Tagged Outside)"))
+
+# 3: Map for Local Wintering Birds
 track_map_local <- ggplot(Movetrack_Prep %>% filter(cohort == "Local Wintering (DARN Tagged)"), 
                           aes(x = recvDeployLon, y = recvDeployLat)) +
   geom_path(aes(group = visit_id, color = as.numeric(ts)), 
@@ -347,27 +356,6 @@ track_map_local <- ggplot(Movetrack_Prep %>% filter(cohort == "Local Wintering (
 
 print(track_map_local)
 
-# 3B: Map for Passage Migrants
-track_map_passage <- ggplot(Movetrack_Prep %>% filter(cohort == "Passage Migrant (Tagged Outside)"), 
-                            aes(x = recvDeployLon, y = recvDeployLat)) +
-  geom_path(aes(group = visit_id, color = as.numeric(ts)), 
-            arrow = arrow(type = "closed", length = unit(0.1, "inches")),
-            linewidth = 0.8, alpha = 0.7) +
-  geom_point(aes(color = as.numeric(ts)), size = 2) +
-  scale_color_viridis_c(
-    option = "plasma", name = "Date (Gradient)",
-    breaks = c(min(as.numeric(Movetrack_Prep$ts)), max(as.numeric(Movetrack_Prep$ts))),
-    labels = c("Early (Dec)", "Late (Apr)")
-  ) +
-  facet_wrap(~ movement_type) + # Split into Arrivals vs Departures
-  theme_minimal() +
-  labs(
-    title = "DARN Array: Passage Migrant Tracks",
-    subtitle = "Color gradient represents time of season",
-    x = "Longitude", y = "Latitude"
-  )
-
-print(track_map_passage)
 
 # Step 4: Rose Plots for Final Bearings
 # EXTRACTING TERMINAL EVENTS: For departures, we want the last known bearing. For arrivals, the first.
@@ -382,7 +370,7 @@ Final_Bearings <- Movetrack_Prep %>%
 
 # ROSE PLOT GENERATION (Separated by Cohort)
 
-# 4A: Rose Plot for Local Wintering Birds
+# 4: Rose Plot for Local Wintering Birds
 rose_plot_local <- ggplot(Final_Bearings %>% filter(cohort == "Local Wintering (DARN Tagged)"), 
                           aes(x = (antBearing_adj + 22.5) %% 360, fill = season)) +
   geom_histogram(breaks = seq(0, 360, by = 45), color = "black", alpha = 0.8) +
@@ -403,26 +391,6 @@ rose_plot_local <- ggplot(Final_Bearings %>% filter(cohort == "Local Wintering (
 
 print(rose_plot_local)
 
-# 4B: Rose Plot for Passage Migrants
-rose_plot_passage <- ggplot(Final_Bearings %>% filter(cohort == "Passage Migrant (Tagged Outside)"), 
-                            aes(x = (antBearing_adj + 22.5) %% 360, fill = season)) +
-  geom_histogram(breaks = seq(0, 360, by = 45), color = "black", alpha = 0.8) +
-  coord_polar(start = -22.5 * pi / 180, direction = 1) + 
-  scale_x_continuous(
-    limits = c(0, 360), breaks = seq(22.5, 337.5, by = 45),
-    labels = c("N", "NE", "E", "SE", "S", "SW", "W", "NW")
-  ) +
-  scale_fill_manual(values = c("Early Winter" = "steelblue", "Mid-winter" = "mediumpurple", "Late Winter" = "darkorange")) +
-  theme_minimal() +
-  facet_wrap(~movement_type) + 
-  labs(
-    title = "Rose Plot: Passage Migrant Terminal Bearings",
-    subtitle = "Separated by Arrivals/Departures and Time of Season",
-    x = NULL, y = "Count of Events", fill = "Season"
-  ) +
-  theme(axis.text.y = element_blank(), axis.ticks.y = element_blank())
-
-print(rose_plot_passage)
 
 # -------------------------------------------------------------------------
 # 6a. Prepping for the movetrack Hidden Markov Model (HMM)
@@ -624,7 +592,6 @@ Raw_Event_Analysis <- Movetrack_Prep %>%
 # 8. Biological Timing & Raw Data Outcome Analysis (Consolidated Bins)
 # -------------------------------------------------------------------------
 
-# Step 1: Calculate Biological Time Bins (Merging undersampled periods)
 Biological_Timing_Raw <- Movetrack_Prep %>%
   group_by(motusTagID, visit_id, movement_type) %>%
   summarise(
@@ -632,25 +599,20 @@ Biological_Timing_Raw <- Movetrack_Prep %>%
     ping_count = n(),
     .groups = "drop"
   ) %>%
-  mutate(date = as_date(last_ts)) %>%
-  left_join(twilight_data, by = "date") %>%
+  # FIX: Convert final ping to local time to prevent the UTC midnight split
   mutate(
-    # Duration of Nautical Twilight (approx 60-70 mins in OK)
+    last_ts_local = with_tz(last_ts, tzone = "America/Chicago"),
+    date_local = as_date(last_ts_local)
+  ) %>%
+  left_join(twilight_data, by = "date_local") %>%
+  mutate(
     twilight_dur = as.numeric(difftime(sunrise, nauticalDawn, units = "secs")),
     
-    # Categorize into Consolidated Biological Periods
     bio_period = case_when(
-      # Pure Night: Before Nautical Dawn or after Nautical Dusk
-      last_ts <= nauticalDawn | last_ts >= nauticalDusk ~ "Nocturnal",
-      
-      # Sunrise Window: Merging Dawn Transition (Pre-Sunrise) with Post-Sunrise Activity
-      last_ts > nauticalDawn & last_ts <= (sunrise + twilight_dur) ~ "Sunrise Window",
-      
-      # Sunset Window: Merging Pre-Sunset Activity with Dusk Transition (Post-Sunset)
-      last_ts >= (sunset - twilight_dur) & last_ts < nauticalDusk ~ "Sunset Window",
-      
-      # Mid-Day Split: Remaining daylight hours
-      last_ts > (sunrise + twilight_dur) & last_ts < (sunrise + (sunset-sunrise)/2) ~ "Morning",
+      last_ts_local <= nauticalDawn | last_ts_local >= nauticalDusk ~ "Nocturnal",
+      last_ts_local > nauticalDawn & last_ts_local <= (sunrise + twilight_dur) ~ "Sunrise Window",
+      last_ts_local >= (sunset - twilight_dur) & last_ts_local < nauticalDusk ~ "Sunset Window",
+      last_ts_local > (sunrise + twilight_dur) & last_ts_local < (sunrise + (sunset-sunrise)/2) ~ "Morning",
       TRUE ~ "Afternoon"
     ),
     bio_period = factor(bio_period, levels = c(
@@ -658,25 +620,44 @@ Biological_Timing_Raw <- Movetrack_Prep %>%
     ))
   )
 
-# Step 2: Join with Outcome
+# Step 2: Join with Outcome and Define Native Hardware Class
 Raw_Analysis_Final <- Biological_Timing_Raw %>%
   left_join(Visit_Status_Raw, by = "visit_id") %>%
+  # Bring in tagModel natively from Movetrack_Prep (No Tag_Metadata DB join needed!)
+  left_join(Movetrack_Prep %>% distinct(visit_id, tagModel), by = "visit_id") %>%
   mutate(
     outcome = case_when(
       movement_type == "Arrival" ~ "Confirmed Return",
       movement_type == "Departure" & !is_terminal ~ "Temporary Departure",
       movement_type == "Departure" & is_terminal  ~ "Terminal Disappearance"
+    ),
+    # Define hardware natively
+    hardware_class = case_when(
+      grepl("LifeTag", tagModel, ignore.case = TRUE) ~ "LifeTag (Solar)",
+      grepl("Hybrid", tagModel, ignore.case = TRUE) ~ "Hybrid (Batt/Solar)",
+      TRUE ~ "Other/Unknown"
     )
   )
 
 # -------------------------------------------------------------------------
-# 9. Statistical Matrix & Permutation Analysis
+# 9B. Statistical Matrix & Permutation Analysis
 # -------------------------------------------------------------------------
 
-# Step 1: Construct the Observed Contingency Matrix using consolidated periods
+# Step 1: Construct the Observed Contingency Matrix (Overall)
 obs_matrix <- table(Raw_Analysis_Final$outcome, Raw_Analysis_Final$bio_period)
 
+# NEW: Construct the 3-Way Matrix subset by TagModel (Hardware Class)
+cat("\n--- 3-Way Outcome Matrix (Subset by TagModel) ---\n")
+# ftable creates a clean, readable 'flat' table for 3 variables
+matrix_by_tag <- ftable(
+  Hardware = Raw_Analysis_Final$hardware_class, 
+  Outcome = Raw_Analysis_Final$outcome, 
+  Period = Raw_Analysis_Final$bio_period
+)
+print(matrix_by_tag)
+
 # Step 2: Filter out any remaining zero-sum columns (Safety check for NaN)
+# (Using the original 2-way matrix for the overall Chi-Squared test)
 obs_matrix_clean <- obs_matrix[, colSums(obs_matrix) > 0]
 
 # Step 3: Re-run the Permuted Chi-Squared (B=5000 for high precision)
@@ -707,8 +688,44 @@ print(matrix_diff_plot)
 cat("\n--- Cleaned Statistical Weight ---\n")
 print(paste("Robust Permuted P-Value:", round(chisq_test_clean$p.value, 4)))
 
-cat("\n--- Nocturnal Spike Audit ---\n")
-print(obs_matrix[, "Nocturnal", drop = FALSE])
+
+# -------------------------------------------------------------------------
+# 9b. Hardware Timing Bias Audit (The "Solar Blackout" Test)
+# -------------------------------------------------------------------------
+
+cat("\n--- HARDWARE TIMING BIAS AUDIT (Terminal Disappearances Only) ---\n")
+
+# Isolate terminal birds. NO JOIN NEEDED because hardware_class is natively there!
+Terminal_Events <- Raw_Analysis_Final %>%
+  filter(outcome == "Terminal Disappearance")
+
+# Create a contingency table: When did the different tags 'disappear'?
+hardware_timing_matrix <- table(Terminal_Events$hardware_class, Terminal_Events$bio_period)
+print(hardware_timing_matrix)
+
+# Statistical Test for Bias
+# H0: Tag type does not affect the observed time of disappearance.
+# HA: Tag type significantly biases the observed time (e.g., LifeTags skew Daylight/Sunset).
+bias_test <- fisher.test(hardware_timing_matrix, simulate.p.value = TRUE, B = 5000)
+
+cat(glue("\nHardware Bias Permuted p-value: {round(bias_test$p.value, 4)}\n"))
+cat("Interpretation: If p < 0.05, LifeTags and Hybrids are recording fundamentally different departure schedules.\n\n")
+
+# Visualizing the Bias
+bias_plot <- ggplot(Terminal_Events, aes(x = bio_period, fill = hardware_class)) +
+  geom_bar(position = "dodge", color = "black", alpha = 0.8) +
+  scale_fill_manual(values = c("LifeTag (Solar)" = "#f1c40f", "Hybrid (Batt/Solar)" = "#2c3e50")) +
+  theme_minimal() +
+  labs(
+    title = "Observed Departure Timing by Hardware Class",
+    subtitle = glue("Terminal Disappearances Only | Fisher's p = {round(bias_test$p.value, 4)}"),
+    x = "Biological Period of Last Ping",
+    y = "Number of Birds",
+    fill = "Tag Technology"
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+print(bias_plot)
 
 # -------------------------------------------------------------------------
 # 10. Consolidated Bird Signatures (Sample Size Optimization)
@@ -838,89 +855,374 @@ print(rssi_plot)
 #* WEATHER COMPARISONS **********************
 #********************************************
   
-# --- 12. Collapsing Overlapping Micro-Windows ---
+# -------------------------------------------------------------------------
+# 12. Continuous Winter Weather Extraction (Oklahoma Mesonet)
+# -------------------------------------------------------------------------
 
-Collapsed_Windows <- Micro_Windows %>%
-  arrange(window_start) %>%
-  # Identify where a new block must start (gap > 0 days)
-  mutate(new_block = window_start > lag(window_end, default = first(window_start))) %>%
-  mutate(block_id = cumsum(new_block)) %>%
-  group_by(block_id) %>%
-  summarise(
-    start_dt = min(window_start),
-    end_dt = max(window_end),
-    .groups = "drop"
+cat("\n--- DOWNLOADING CONTINUOUS WINTER CLIMATE DATA ---\n")
+
+library(mesonet)
+library(tidyverse)
+
+# 1. Define the continuous winter seasons
+# Using simple YYYY-MM-DD as preferred by mnet_retrieve
+winter_seasons <- data.frame(
+  start = c("2020-11-15", "2021-11-15", "2022-11-15"),
+  end   = c("2021-04-30", "2022-04-30", "2023-04-30")
+)
+
+target_stations <- c("KENT", "BOIS")
+
+# 2. Use your proven map_df() and mnet_retrieve() syntax
+weather_raw <- map_df(1:nrow(winter_seasons), function(i) {
+  cat(glue("Fetching Season {i}: {winter_seasons$start[i]} to {winter_seasons$end[i]}...\n"))
+  
+  mnet_retrieve(
+    start_date = winter_seasons$start[i],
+    end_date = winter_seasons$end[i],
+    stid = target_stations
   )
+})
 
-cat(glue("\n--- TEMPORAL COLLAPSE COMPLETE ---\n"))
-cat(glue("Original Redundant Windows: {nrow(Micro_Windows)}\n"))
-cat(glue("Surgical Blocks to Download: {nrow(Collapsed_Windows)}\n\n"))
-
-# --- 13. Averaging KENT and BOIS into Regional Weather ---
-
-cat("\n--- CALCULATING CIMARRON REGIONAL AVERAGE (KENT + BOIS) ---\n")
-
-weather_regional <- weather_clean %>%
-  group_by(ts_weather) %>%
+# 3. Standardize, average the stations, and prep for Section 7
+weather_micro <- weather_raw %>%
+  # Bulletproof Step A: Force all columns to lowercase (turns TIME to time, TAIR to tair)
+  rename_with(tolower) %>%
+  # Bulletproof Step B: If the package returned 'date' instead of 'time', seamlessly rename it
+  rename(any_of(c(time = "date"))) %>%
+  # Now 'time' absolutely exists and is safe to convert
+  mutate(time = as_datetime(time, tz = "America/Chicago")) %>%
+  # Group by the timestamp to average KENT and BOIS together
+  group_by(time) %>%
   summarise(
-    # Average the critical metrics
     tair = mean(tair, na.rm = TRUE),
     srad = mean(srad, na.rm = TRUE),
-    wspd = mean(wspd, na.rm = TRUE),
-    ts05 = mean(ts05, na.rm = TRUE),
     .groups = "drop"
   ) %>%
-  arrange(ts_weather) %>%
-  mutate(
-    # Calculate Regional Inertia based on the averaged temperature
-    is_freezing = if_else(tair <= 0, 1, 0),
-    cold_inertia_hrs = slider::slide_dbl(is_freezing, sum, .before = 1440) * (5/60)
-  )
+  # Rename 'time' back to 'date' to perfectly feed into Section 7
+  rename(date = time) %>%
+  arrange(date)
 
-cat(glue("Regional timeline created with {nrow(weather_regional)} timestamps.\n"))
-cat(glue("Max Regional Inertia: {max(weather_regional$cold_inertia_hrs, na.rm=TRUE)} hours.\n\n"))
+cat(glue("Mesonet download complete. Unbroken baseline of {nrow(weather_micro)} intervals retrieved.\n"))
+
 
 # -------------------------------------------------------------------------
-# 14. Capped Absence Duration vs. Thermal Inertia
+# 13. Weather Integration: Smoothed Anomaly, Shock & Consecutive Freeze
 # -------------------------------------------------------------------------
 
-cat("\n--- REFINING ABSENCE WINDOWS (MAX 100 DAYS) ---\n")
+cat("\n--- CALCULATING WEATHER TRIGGERS (SMOOTHED ANOMALY, SHOCK & DURATION) ---\n")
 
-# 100 days in hours = 2400
-max_absence_threshold <- 2400
+# Ensure the 'zoo' package is loaded
+if(!require(zoo)) install.packages("zoo")
+library(zoo)
 
-Inertia_Analysis_Capped <- Resident_Analysis %>%
-  group_by(motusTagID) %>%
-  arrange(last_ts) %>%
+# Step 1: Base formatting and extract Julian Day
+weather_base <- weather_micro %>%
+  rename_with(tolower) %>%
   mutate(
-    absence_hrs = as.numeric(difftime(lead(last_ts), last_ts, units = "hours"))
+    ts_weather = ymd_hms(substr(as.character(date), 1, 19), tz = "America/Chicago"),
+    tair = as.numeric(tair), 
+    srad = as.numeric(srad),
+    day_of_year = yday(ts_weather) # Extract Julian Day (1-365/366)
   ) %>%
-  # Filter: Must be at least 5 days AND less than 100 days
-  filter(movement_type == "Departure", 
-         absence_hrs >= 120,
-         absence_hrs <= max_absence_threshold) %>% 
+  filter(!is.na(ts_weather)) %>%
+  group_by(ts_weather, day_of_year) %>%
+  summarise(tair = mean(tair, na.rm = TRUE), srad = mean(srad, na.rm = TRUE), .groups="drop") %>%
+  arrange(ts_weather)
+
+# Step 2: Calculate the RAW daily averages
+raw_normals <- weather_base %>%
+  group_by(day_of_year) %>%
+  summarise(raw_tair = mean(tair, na.rm = TRUE), .groups = "drop") %>%
+  arrange(day_of_year)
+
+# Step 3: The Triplicate Wrap (7-Day Centered Moving Average)
+# Triplicate the year to seamlessly calculate rolling means over Dec 31 -> Jan 1
+daily_normals <- bind_rows(raw_normals, raw_normals, raw_normals) %>%
+  mutate(
+    # 7-day window: 3 days before, the current day, and 3 days after
+    normal_tair = rollmean(raw_tair, k = 7, fill = NA, align = "center")
+  ) %>%
+  # Slice exactly the middle year to drop the padding and keep the perfectly smoothed 365 days
+  slice((nrow(raw_normals) + 1) : (nrow(raw_normals) * 2)) %>%
+  select(day_of_year, normal_tair)
+
+# Step 4: Merge and calculate the Anomaly, Shock, and Stopwatch
+weather_regional <- weather_base %>%
+  left_join(daily_normals, by = "day_of_year") %>%
+  mutate(
+    # 1. The Climatological Anomaly (Departure from the SMOOTHED Normal)
+    temp_anomaly = tair - normal_tair,
+    
+    # 2. Acute Shock (24h Delta-T)
+    tair_24h_ago = lag(tair, 288),
+    delta_t_24h = tair - tair_24h_ago,
+    
+    # 3. Freezing Flag & Stopwatch
+    is_freezing = if_else(tair <= 0, 1, 0),
+    thaw_id = cumsum(is_freezing == 0)
+  ) %>%
+  group_by(thaw_id) %>%
+  mutate(
+    consecutive_freeze_hrs = cumsum(is_freezing) * (5/60)
+  ) %>%
   ungroup() %>%
-  mutate(time_match = floor_date(last_ts, "5 mins")) %>%
-  left_join(weather_regional, by = c("time_match" = "ts_weather"))
+  select(-thaw_id) # Clean up
 
-# Audit the reduction
-n_dropped <- nrow(Inertia_Analysis) - nrow(Inertia_Analysis_Capped)
-cat(glue("Dropped {n_dropped} trans-seasonal absences (> 100 days).\n"))
-cat(glue("Remaining local behavioral events: {nrow(Inertia_Analysis_Capped)}\n\n"))
+cat(glue("Weather loaded. Max Freeze Streak: {round(max(weather_regional$consecutive_freeze_hrs, na.rm=T), 1)} hrs.\n"))
+cat(glue("Most Extreme Cold Anomaly: {round(min(weather_regional$temp_anomaly, na.rm=T), 1)} C below 7-day smoothed normal.\n"))
 
 # -------------------------------------------------------------------------
-# 15. The Refined Sensitivity Plot
+# 14. The Acute Shock Trigger Analysis (Density Curves & K-S Test)
 # -------------------------------------------------------------------------
 
+cat("\n--- PLOTTING ACUTE SHOCK DENSITY CURVES ---\n")
 
-ggplot(Inertia_Analysis_Capped, aes(x = cold_inertia_hrs, y = absence_hrs)) +
-  geom_point(aes(color = srad), size = 3, alpha = 0.7) +
-  geom_smooth(method = "lm", color = "firebrick", linewidth = 1.2) +
-  scale_color_viridis_c(option = "plasma", name = "Solar Gain (W/m^2)") +
+# Ensure the dataframe exists and is filtered
+Acute_Shock_Analysis <- Raw_Analysis_Final %>%
+  filter(movement_type == "Departure") %>%
+  ungroup() %>%
+  mutate(time_match = floor_date(last_ts_local, "5 mins")) %>%
+  left_join(weather_regional, by = c("time_match" = "ts_weather")) %>%
+  filter(!is.na(delta_t_24h))
+
+# Console Summary for Statistical Proof (Adding Standard Deviation for Spread)
+cat("\n--- Acute Shock (\u0394T) Statistics by Outcome ---\n")
+summary_stats <- Acute_Shock_Analysis %>%
+  group_by(outcome) %>%
+  summarise(
+    Mean_24h_Delta = round(mean(delta_t_24h, na.rm=TRUE), 2),
+    Median_24h_Delta = round(median(delta_t_24h, na.rm=TRUE), 2),
+    SD_Delta = round(sd(delta_t_24h, na.rm=TRUE), 2), # Measures how 'fat' the tails are
+    N_Events = n()
+  )
+print(summary_stats)
+
+# Two-Sample Kolmogorov-Smirnov Test
+# Evaluates if the Temporary and Terminal distributions have fundamentally different shapes
+temp_departures <- Acute_Shock_Analysis %>% filter(outcome == "Temporary Departure") %>% pull(delta_t_24h)
+term_disappearances <- Acute_Shock_Analysis %>% filter(outcome == "Terminal Disappearance") %>% pull(delta_t_24h)
+
+ks_result <- ks.test(temp_departures, term_disappearances)
+
+cat(glue("\n--- Kolmogorov-Smirnov Test for Distribution Difference ---\n"))
+cat(glue("D-statistic: {round(ks_result$statistic, 4)} | p-value: {round(ks_result$p.value, 4)}\n"))
+cat("Interpretation: If p < 0.05, the shapes/spreads of these two departure types are statistically distinct.\n\n")
+
+# Density Plot (Smooth Curves instead of stacked bars)
+acute_density_plot <- ggplot(Acute_Shock_Analysis, aes(x = delta_t_24h, fill = outcome, color = outcome)) +
+  geom_density(alpha = 0.4, linewidth = 1) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray20", linewidth = 1) +
+  scale_fill_manual(values = c("Temporary Departure" = "#2c3e50", "Terminal Disappearance" = "#f1c40f")) +
+  scale_color_manual(values = c("Temporary Departure" = "#2c3e50", "Terminal Disappearance" = "#f1c40f")) +
   theme_minimal() +
   labs(
-    title = "Regional Thermal Sensitivity: Local Residents",
-    subtitle = "Absences: 5–100 Day Range | Regional Weather Avg",
-    x = "Cumulative Freezing Hours (Previous 120h)",
-    y = "Absence Duration (Hours)"
+    title = "Acute Shock Departure Signatures: Density Curves",
+    subtitle = glue("K-S Test p-value: {round(ks_result$p.value, 4)} | Comparing Distribution Shapes"),
+    x = "24-Hour Temperature Change (\u00B0C) (Negative = Sudden Plunge)",
+    y = "Density (Proportion of Events)",
+    fill = "Event Outcome",
+    color = "Event Outcome"
   )
+
+print(acute_density_plot)
+
+# -------------------------------------------------------------------------
+# 15. Cold Snap Duration (The "Persistence" Trigger)
+# -------------------------------------------------------------------------
+
+cat("\n--- ANALYZING COLD SNAP PERSISTENCE TRIGGERS ---\n")
+
+# Join the new consecutive freeze data to the departures
+Duration_Analysis <- Raw_Analysis_Final %>%
+  filter(movement_type == "Departure") %>%
+  ungroup() %>%
+  mutate(time_match = floor_date(last_ts_local, "5 mins")) %>%
+  left_join(weather_regional, by = c("time_match" = "ts_weather")) %>%
+  filter(!is.na(consecutive_freeze_hrs))
+
+# Console Summary for Statistical Proof
+cat("\n--- Consecutive Freeze Hours at Time of Departure ---\n")
+print(
+  Duration_Analysis %>%
+    group_by(outcome) %>%
+    summarise(
+      Mean_Freeze_Duration = round(mean(consecutive_freeze_hrs, na.rm=TRUE), 1),
+      Median_Freeze_Duration = round(median(consecutive_freeze_hrs, na.rm=TRUE), 1),
+      Max_Endurance_Hrs = round(max(consecutive_freeze_hrs, na.rm=TRUE), 1),
+      N_Events = n()
+    )
+)
+
+# Plot 15A: The Pooled "Breaking Point" (All Departures)
+pooled_duration_plot <- ggplot(Duration_Analysis, aes(x = consecutive_freeze_hrs)) +
+  geom_density(fill = "steelblue", alpha = 0.5, color = "black", linewidth = 1) +
+  theme_minimal() +
+  labs(
+    title = "The Breaking Point: Pooled Departure Thresholds",
+    subtitle = "Density of all departures relative to the duration of the active freeze streak",
+    x = "Consecutive Hours Below Freezing at Time of Departure",
+    y = "Density (Proportion of Departures)"
+  )
+
+print(pooled_duration_plot)
+
+# Plot 15B: The Split "Tolerance vs. Attrition" (Temporary vs. Terminal)
+split_duration_plot <- ggplot(Duration_Analysis, aes(x = consecutive_freeze_hrs, fill = outcome, color = outcome)) +
+  geom_density(alpha = 0.4, linewidth = 1) +
+  scale_fill_manual(values = c("Temporary Departure" = "#2c3e50", "Terminal Disappearance" = "#f1c40f")) +
+  scale_color_manual(values = c("Temporary Departure" = "#2c3e50", "Terminal Disappearance" = "#f1c40f")) +
+  theme_minimal() +
+  labs(
+    title = "Tolerance vs. Attrition: Duration-Driven Departures",
+    subtitle = "Comparing temporary foraging flights to permanent relocation thresholds",
+    x = "Consecutive Hours Below Freezing at Time of Departure",
+    y = "Density (Proportion of Departures)",
+    fill = "Event Outcome",
+    color = "Event Outcome"
+  )
+
+print(split_duration_plot)
+# -------------------------------------------------------------------------
+# 15. Cold Snap Duration (The 8-Hour Peak Smoothing)
+# -------------------------------------------------------------------------
+
+cat("\n--- ANALYZING COLD SNAP PERSISTENCE (8-HOUR PEAK) ---\n")
+
+# Ensure the 'zoo' package is loaded for rolling window calculations
+if(!require(zoo)) install.packages("zoo")
+library(zoo)
+
+# 1. Apply the 8-hour rolling peak to the weather data
+weather_smoothed <- weather_regional %>%
+  arrange(ts_weather) %>%
+  mutate(
+    # 8 hours = 96 intervals of 5 minutes. rollmaxr looks strictly backwards.
+    peak_freeze_8h = rollmaxr(consecutive_freeze_hrs, k = 96, fill = NA)
+  )
+
+# 2. Join the smoothed data to the departures
+Duration_Analysis_Smoothed <- Raw_Analysis_Final %>%
+  filter(movement_type == "Departure") %>%
+  ungroup() %>%
+  mutate(time_match = floor_date(last_ts_local, "5 mins")) %>%
+  left_join(weather_smoothed, by = c("time_match" = "ts_weather")) %>%
+  filter(!is.na(peak_freeze_8h))
+
+# 3. Console Summary for Statistical Proof
+cat("\n--- Peak Freeze Hours (Within 8h of Departure) ---\n")
+print(
+  Duration_Analysis_Smoothed %>%
+    group_by(outcome) %>%
+    summarise(
+      Mean_Peak_Freeze = round(mean(peak_freeze_8h, na.rm=TRUE), 1),
+      Median_Peak_Freeze = round(median(peak_freeze_8h, na.rm=TRUE), 1),
+      Max_Endurance_Hrs = round(max(peak_freeze_8h, na.rm=TRUE), 1),
+      N_Events = n()
+    )
+)
+
+# Plot 15B: The Split "Tolerance vs. Attrition" (Smoothed)
+split_duration_smoothed_plot <- ggplot(Duration_Analysis_Smoothed, aes(x = peak_freeze_8h, fill = outcome, color = outcome)) +
+  geom_density(alpha = 0.4, linewidth = 1) +
+  scale_fill_manual(values = c("Temporary Departure" = "#2c3e50", "Terminal Disappearance" = "#f1c40f")) +
+  scale_color_manual(values = c("Temporary Departure" = "#2c3e50", "Terminal Disappearance" = "#f1c40f")) +
+  theme_minimal() +
+  labs(
+    title = "Tolerance vs. Attrition: Duration-Driven Departures",
+    subtitle = "Peak consecutive freezing hours experienced within 8 hours prior to departure",
+    x = "Peak Consecutive Hours Below Freezing (8h Window)",
+    y = "Density (Proportion of Departures)",
+    fill = "Event Outcome",
+    color = "Event Outcome"
+  )
+
+print(split_duration_smoothed_plot)
+
+# -------------------------------------------------------------------------
+# 15c. Statistical Measurement of the Duration Shift
+# -------------------------------------------------------------------------
+
+cat("\n--- STATISTICAL SHIFT TEST: WILCOXON RANK-SUM ---\n")
+
+# Extract the smoothed duration vectors for both outcomes
+temp_durations <- Duration_Analysis_Smoothed %>% 
+  filter(outcome == "Temporary Departure") %>% 
+  pull(peak_freeze_8h)
+
+term_durations <- Duration_Analysis_Smoothed %>% 
+  filter(outcome == "Terminal Disappearance") %>% 
+  pull(peak_freeze_8h)
+
+# Run the non-parametric Wilcoxon test to check for a shift in central tendency
+shift_test <- wilcox.test(temp_durations, term_durations, exact = FALSE)
+
+cat(glue("Wilcoxon W-statistic: {round(shift_test$statistic, 2)}\n"))
+cat(glue("p-value: {round(shift_test$p.value, 4)}\n"))
+cat("Interpretation: If p < 0.05, the median shift between Temporary (11.2h) and Terminal (5.3h) is statistically significant.\n\n")
+
+# Run the K-S test again just to see if the overall distribution shapes differ
+ks_duration_test <- ks.test(temp_durations, term_durations)
+cat(glue("Kolmogorov-Smirnov D-statistic: {round(ks_duration_test$statistic, 4)}\n"))
+cat(glue("K-S p-value: {round(ks_duration_test$p.value, 4)}\n"))
+cat("Interpretation: If p < 0.05, the overall shape/spread of the two curves are fundamentally distinct.\n")
+
+# -------------------------------------------------------------------------
+# 16. Discrete-Time Expansion (The Bird-Day Matrix)
+# -------------------------------------------------------------------------
+
+cat("\n--- BUILDING BIRD-DAY MATRIX FOR GLM MODELING ---\n")
+
+# Step 1: Collapse the Long event data into Wide visit boundaries
+Visit_Bounds <- Raw_Analysis_Final %>%
+  group_by(motusTagID, hardware_class, visit_id) %>%
+  summarise(
+    # Find the first and last timestamps within this specific visit
+    start_date = as.Date(min(last_ts_local, na.rm = TRUE), tz = "America/Chicago"),
+    end_date   = as.Date(max(last_ts_local, na.rm = TRUE), tz = "America/Chicago"),
+    # Isolate the outcome (Temporary/Terminal) from the Departure row of this visit
+    departure_type = first(na.omit(outcome[movement_type == "Departure"])),
+    .groups = "drop"
+  ) %>%
+  # Safety catch: Drop any visits that completely lack timestamps
+  filter(!is.infinite(start_date) & !is.infinite(end_date))
+
+# Step 2: Expand the Boundaries into Daily Occurrences
+Bird_Day_Visits <- Visit_Bounds %>%
+  rowwise() %>%
+  mutate(date = list(seq(start_date, end_date, by = "day"))) %>%
+  unnest(date) %>%
+  # Categorize the biological state of the bird on that specific day
+  mutate(
+    daily_state = case_when(
+      date == start_date & date == end_date ~ "Arrival & Departure",
+      date == start_date ~ "Arrival",
+      date == end_date ~ "Departure",
+      TRUE ~ "Present"
+    ),
+    # The Binomial Response Variable: 1 if it left that day, 0 if it stayed
+    departure_event = if_else(grepl("Departure", daily_state), 1, 0),
+    
+    # Only attach the departure type to the actual day it left
+    departure_type = if_else(departure_event == 1, departure_type, NA_character_)
+  ) %>%
+  ungroup() %>%
+  select(motusTagID, hardware_class, visit_id, date, daily_state, departure_event, departure_type)
+
+# Step 3: Fill in the Gaps (The Absences)
+Bird_Day_Matrix <- Bird_Day_Visits %>%
+  group_by(motusTagID, hardware_class) %>%
+  # complete() automatically finds missing days between visits and creates rows
+  complete(date = seq(min(date), max(date), by = "day")) %>%
+  mutate(
+    daily_state = replace_na(daily_state, "Absent"),
+    departure_event = replace_na(departure_event, 0), # Absent days are not new departures
+    visit_id = zoo::na.locf(visit_id, na.rm = FALSE)  # Carries the last visit ID forward
+  ) %>%
+  ungroup() %>%
+  arrange(motusTagID, date)
+
+# Console Audit
+cat(glue("Expansion complete: {nrow(Bird_Day_Matrix)} total bird-days logged.\n"))
+cat("--- Breakdown of Daily States ---\n")
+print(table(Bird_Day_Matrix$daily_state))
