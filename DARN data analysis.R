@@ -884,22 +884,25 @@ weather_raw <- map_df(1:nrow(winter_seasons), function(i) {
   )
 })
 
-# 3. Standardize, average the stations, and prep for Section 7
+# 3. Standardize, compute wind vectors, and average the stations
 weather_micro <- weather_raw %>%
-  # Bulletproof Step A: Force all columns to lowercase (turns TIME to time, TAIR to tair)
   rename_with(tolower) %>%
-  # Bulletproof Step B: If the package returned 'date' instead of 'time', seamlessly rename it
   rename(any_of(c(time = "date"))) %>%
-  # Now 'time' absolutely exists and is safe to convert
-  mutate(time = as_datetime(time, tz = "America/Chicago")) %>%
-  # Group by the timestamp to average KENT and BOIS together
+  mutate(
+    time = as_datetime(time, tz = "America/Chicago"),
+    # Decompose wind into linear vectors BEFORE averaging
+    u_wind = -wspd * sin(wdir * pi / 180),
+    v_wind = -wspd * cos(wdir * pi / 180)
+  ) %>%
   group_by(time) %>%
   summarise(
     tair = mean(tair, na.rm = TRUE),
     srad = mean(srad, na.rm = TRUE),
+    wspd = mean(wspd, na.rm = TRUE),
+    u_wind = mean(u_wind, na.rm = TRUE),
+    v_wind = mean(v_wind, na.rm = TRUE),
     .groups = "drop"
   ) %>%
-  # Rename 'time' back to 'date' to perfectly feed into Section 7
   rename(date = time) %>%
   arrange(date)
 
@@ -923,11 +926,21 @@ weather_base <- weather_micro %>%
     ts_weather = ymd_hms(substr(as.character(date), 1, 19), tz = "America/Chicago"),
     tair = as.numeric(tair), 
     srad = as.numeric(srad),
+    wspd = as.numeric(wspd),       # NEW: Capture wind speed
+    u_wind = as.numeric(u_wind),   # NEW: Capture U-vector
+    v_wind = as.numeric(v_wind),   # NEW: Capture V-vector
     day_of_year = yday(ts_weather) # Extract Julian Day (1-365/366)
   ) %>%
   filter(!is.na(ts_weather)) %>%
   group_by(ts_weather, day_of_year) %>%
-  summarise(tair = mean(tair, na.rm = TRUE), srad = mean(srad, na.rm = TRUE), .groups="drop") %>%
+  summarise(
+    tair = mean(tair, na.rm = TRUE), 
+    srad = mean(srad, na.rm = TRUE),
+    wspd = mean(wspd, na.rm = TRUE),       # NEW: Pass it through
+    u_wind = mean(u_wind, na.rm = TRUE),   # NEW: Pass it through
+    v_wind = mean(v_wind, na.rm = TRUE),   # NEW: Pass it through
+    .groups="drop"
+  ) %>%
   arrange(ts_weather)
 
 # Step 2: Calculate the RAW daily averages
@@ -1226,3 +1239,227 @@ Bird_Day_Matrix <- Bird_Day_Visits %>%
 cat(glue("Expansion complete: {nrow(Bird_Day_Matrix)} total bird-days logged.\n"))
 cat("--- Breakdown of Daily States ---\n")
 print(table(Bird_Day_Matrix$daily_state))
+
+# -------------------------------------------------------------------------
+# 17. Daily Weather Aggregation & GLM Join
+# -------------------------------------------------------------------------
+
+cat("\n--- AGGREGATING DAILY WEATHER FOR GLM ---\n")
+
+Daily_Weather <- weather_regional %>%
+  # Extract the pure calendar day from the 5-minute timestamp
+  mutate(calendar_date = as.Date(ts_weather, tz = "America/Chicago")) %>%
+  group_by(calendar_date) %>%
+  summarise(
+    # 1. Thermal Means & Extremes
+    t_mean = mean(tair, na.rm = TRUE),
+    t_min  = min(tair, na.rm = TRUE),
+    t_max  = max(tair, na.rm = TRUE),
+    
+    # 2. Heating Degree Days (HDD): Cumulative cold stress below 18C baseline
+    hdd_18 = if_else(t_mean < 18, 18 - t_mean, 0),
+    
+    # 3. Anomalies & Acute Shocks
+    anomaly_mean = mean(temp_anomaly, na.rm = TRUE),
+    anomaly_min  = min(temp_anomaly, na.rm = TRUE), # The most extreme drop below normal
+    shock_max    = min(delta_t_24h, na.rm = TRUE),  # The sharpest 24h plunge that day
+    
+    # 4. Persistence (Ice)
+    freeze_hrs_peak = max(consecutive_freeze_hrs, na.rm = TRUE),
+    
+    # 5. Solar & Wind Energy
+    srad_sum = sum(srad, na.rm = TRUE),     # Total daily solar energy input
+    wspd_mean = mean(wspd, na.rm = TRUE),   # Overall kinetic wind energy
+    u_wind_mean = mean(u_wind, na.rm = TRUE), # Net East/West force
+    v_wind_mean = mean(v_wind, na.rm = TRUE), # Net North/South force
+    
+    .groups = "drop"
+  )
+
+# Join the Daily Weather to the Bird-Day matrix!
+GLM_Dataset <- Bird_Day_Matrix %>%
+  left_join(Daily_Weather, by = c("date" = "calendar_date")) %>%
+  # Filter out days where we have no weather data (e.g., API gaps)
+  filter(!is.na(t_mean))
+
+# Console Audit
+cat(glue("GLM Matrix constructed: {nrow(GLM_Dataset)} bird-days with full weather metrics.\n"))
+cat("Preview of Model Predictors (First 3 Rows):\n")
+print(head(GLM_Dataset %>% select(date, departure_event, t_min, hdd_18, anomaly_min, freeze_hrs_peak, v_wind_mean), 3))
+
+# -------------------------------------------------------------------------
+# 18. Binomial GLM & AIC Hypothesis Testing
+# -------------------------------------------------------------------------
+
+cat("\n--- RUNNING BINOMIAL GLM & AIC COMPETITION ---\n")
+
+# Step 1: Enforce the Golden Rule, Filter for Mid-Winter, and Scale
+Model_Data <- GLM_Dataset %>%
+  # NEW: The Mid-Winter Firewall (Isolate Nov, Dec, Jan, Feb)
+  filter(month(date) %in% c(11, 12, 1, 2)) %>%
+  
+  select(departure_event, hdd_18, shock_max, anomaly_min, freeze_hrs_peak, v_wind_mean, srad_sum) %>%
+  drop_na() %>%
+  mutate(across(-departure_event, ~scale(.)[,1]))
+
+cat(glue("Data standardized & Spring amputated. Running competition on {nrow(Model_Data)} pure winter bird-days...\n\n"))
+
+# Step 2: Build the Candidate Biological Hypotheses
+# Family = binomial tells the GLM we are predicting a 0 or 1 outcome
+m_null    <- glm(departure_event ~ 1, family = binomial(link = "logit"), data = Model_Data)
+m_thermal <- glm(departure_event ~ hdd_18, family = binomial(link = "logit"), data = Model_Data)
+m_shock   <- glm(departure_event ~ shock_max, family = binomial(link = "logit"), data = Model_Data)
+m_anomaly <- glm(departure_event ~ anomaly_min, family = binomial(link = "logit"), data = Model_Data)
+m_ice     <- glm(departure_event ~ freeze_hrs_peak, family = binomial(link = "logit"), data = Model_Data)
+m_wind    <- glm(departure_event ~ v_wind_mean, family = binomial(link = "logit"), data = Model_Data)
+
+# The Additive Model: Do birds wait for high thermal stress + ice + a strong North wind to push them south?
+m_global  <- glm(departure_event ~ hdd_18 + freeze_hrs_peak + v_wind_mean, family = binomial(link = "logit"), data = Model_Data)
+
+# Step 3: Construct the Delta AIC Leaderboard
+aic_table <- tibble(
+  Hypothesis = c(
+    "Null (Random Departures)", 
+    "Thermal Stress (Heating Degree Days)", 
+    "Acute Shock (Max 24h Plunge)",
+    "Climatological Anomaly (Drop below normal)", 
+    "Persistence (Peak Consecutive Ice)", 
+    "Flight Subsidies (V-Wind / North-South)", 
+    "Global Additive (Stress + Ice + Wind)"
+  ),
+  AIC_Score = c(AIC(m_null), AIC(m_thermal), AIC(m_shock), AIC(m_anomaly), AIC(m_ice), AIC(m_wind), AIC(m_global))
+) %>%
+  mutate(
+    Delta_AIC = AIC_Score - min(AIC_Score),
+    # Akaike Weights indicate the probability (0 to 1) that this is the best model in the set
+    Weight = exp(-0.5 * Delta_AIC) / sum(exp(-0.5 * Delta_AIC))
+  ) %>%
+  arrange(Delta_AIC) %>%
+  mutate(across(where(is.numeric), ~round(., 3)))
+
+# Console Readouts
+cat("--- AIC MODEL LEADERBOARD ---\n")
+print(as.data.frame(aic_table))
+
+cat("\n--- COEFFICIENTS OF THE GLOBAL MODEL ---\n")
+cat("Note: Because variables are scaled, larger absolute estimates = stronger biological drivers.\n")
+print(summary(m_global)$coefficients)
+
+# -------------------------------------------------------------------------
+# 19. Full-Season Phenology & Departure Fate Models
+# -------------------------------------------------------------------------
+
+cat("\n--- RUNNING FULL-SEASON & FATE MODELS ---\n")
+
+# Step 1: Format the Data and Fix the Julian Wrap-Around
+Model_Data <- GLM_Dataset %>%
+  mutate(
+    # Create a continuous "Days Since Nov 1" index to avoid the Dec31->Jan1 reset
+    season_start = as.Date(paste0(year(date) - if_else(month(date) < 8, 1, 0), "-11-01")),
+    phenology_day = as.numeric(date - season_start)
+  ) %>%
+  # Only drop rows where the *weather* is missing, don't drop NA departure types
+  drop_na(anomaly_min, hdd_18) %>%
+  # Scale predictors so coefficients can be directly compared
+  mutate(
+    anomaly_scaled = scale(anomaly_min)[,1],
+    pheno_scaled   = scale(phenology_day)[,1]
+  )
+
+cat(glue("Full-Season Matrix compiled: {nrow(Model_Data)} bird-days.\n\n"))
+
+# -------------------------------------------------------------------------
+# MODEL A: The Phenological Shift (Does the weather trigger change over time?)
+# Testing the Interaction (*) between Anomaly and Phenology Day
+m_season <- glm(departure_event ~ anomaly_scaled * pheno_scaled, family = binomial, data = Model_Data)
+
+cat("--- MODEL A: OVERALL DEPARTURE PROBABILITY ---\n")
+cat("Testing if the reaction to cold anomalies shifts as spring approaches.\n")
+print(summary(m_season)$coefficients)
+cat("\n")
+
+# -------------------------------------------------------------------------
+# MODEL B: The Fate Model (Temporary vs. Terminal)
+# Isolating ONLY the days a departure occurred to determine what drove the outcome
+Fate_Data <- Model_Data %>%
+  filter(departure_event == 1) %>%
+  # 1 = Terminal Disappearance, 0 = Temporary Departure
+  mutate(is_terminal = if_else(departure_type == "Terminal Disappearance", 1, 0))
+
+m_fate <- glm(is_terminal ~ anomaly_scaled + pheno_scaled, family = binomial, data = Fate_Data)
+
+cat("--- MODEL B: DEPARTURE FATE (GIVEN A DEPARTURE OCCURRED) ---\n")
+cat("1 = Terminal, 0 = Temporary.\n")
+cat("Positive Phenology estimate = More likely to be Terminal as season progresses.\n")
+cat("Positive Anomaly estimate = More likely to be Terminal when weather is WARMER/NORMAL.\n")
+print(summary(m_fate)$coefficients)
+
+# -------------------------------------------------------------------------
+# 20. The Hiatus Matrix & Return-Trigger Models
+# -------------------------------------------------------------------------
+
+cat("\n--- BUILDING HIATUS MATRIX FOR RETURN MODELS ---\n")
+
+# Step 1: Isolate the "Away" streaks that ended in a successful return
+Hiatus_Data <- GLM_Dataset %>%
+  arrange(motusTagID, date) %>%
+  group_by(motusTagID) %>%
+  mutate(
+    # Flag days the bird is away from the array (Absent or the day it Arrives)
+    is_away = if_else(daily_state %in% c("Absent", "Arrival", "Arrival & Departure"), 1, 0),
+    # Create a unique ID for each continuous block of away time
+    away_streak = cumsum(is_away != lag(is_away, default = 0))
+  ) %>%
+  filter(is_away == 1) %>%
+  group_by(motusTagID, away_streak) %>%
+  # CRITICAL: Drop terminal disappearances! Only keep streaks that actually end in an Arrival
+  filter(any(grepl("Arrival", daily_state))) %>%
+  ungroup() %>%
+  mutate(
+    # The Binomial Response: 1 on the day it returns, 0 for every day it stayed away
+    return_event = if_else(grepl("Arrival", daily_state), 1, 0)
+  )
+
+# Step 2: Enforce the Mid-Winter Firewall and Scale Predictors (Now with Anomaly)
+Return_Model_Data <- Hiatus_Data %>%
+  filter(month(date) %in% c(11, 12, 1, 2)) %>%
+  # Adding anomaly_mean to the selection
+  select(return_event, hdd_18, t_max, v_wind_mean, srad_sum, anomaly_mean) %>%
+  drop_na() %>%
+  mutate(across(-return_event, ~scale(.)[,1]))
+
+# Step 3: Build Candidate Return Hypotheses (Including Anomaly)
+m_ret_null    <- glm(return_event ~ 1, family = binomial, data = Return_Model_Data)
+m_ret_stress  <- glm(return_event ~ hdd_18, family = binomial, data = Return_Model_Data)
+m_ret_thaw    <- glm(return_event ~ t_max, family = binomial, data = Return_Model_Data)
+m_ret_wind    <- glm(return_event ~ v_wind_mean, family = binomial, data = Return_Model_Data)
+m_ret_anomaly <- glm(return_event ~ anomaly_mean, family = binomial, data = Return_Model_Data)
+
+# Global Model: Does a return require the anomaly to break + a tailwind?
+m_ret_global  <- glm(return_event ~ anomaly_mean + v_wind_mean + t_max, family = binomial, data = Return_Model_Data)
+
+# Step 4: Construct the Return Delta AIC Leaderboard
+aic_return_table <- tibble(
+  Hypothesis = c(
+    "Null (Random Returns)", 
+    "Stress Relaxation (HDD)", 
+    "The Thaw (T-Max)", 
+    "Tailwind Subsidy (V-Wind)", 
+    "Return to Normal (Anomaly)",
+    "Global Additive"
+  ),
+  AIC_Score = c(AIC(m_ret_null), AIC(m_ret_stress), AIC(m_ret_thaw), AIC(m_ret_wind), AIC(m_ret_anomaly), AIC(m_ret_global))
+) %>%
+  mutate(
+    Delta_AIC = AIC_Score - min(AIC_Score),
+    Weight = exp(-0.5 * Delta_AIC) / sum(exp(-0.5 * Delta_AIC))
+  ) %>%
+  arrange(Delta_AIC) %>%
+  mutate(across(where(is.numeric), ~round(., 3)))
+
+# Console Readouts
+cat("--- UPDATED AIC RETURN LEADERBOARD ---\n")
+print(as.data.frame(aic_return_table))
+
+cat("\n--- COEFFICIENTS OF THE ANOMALY RETURN MODEL ---\n")
+print(summary(m_ret_anomaly)$coefficients)
